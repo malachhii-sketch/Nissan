@@ -1,0 +1,871 @@
+/**
+ * Nissan Recall Finder: Lot Scanner
+ * Runs in Google Apps Script on a timer. Every few hours it visits each dealership's website,
+ * finds the Nissans in its inventory, and saves them to the Recall CRM (Firebase).
+ *
+ * Setup: paste the scanner account's password below, save, pick "setup" in the toolbar and click Run.
+ */
+const CONFIG = {
+  // The lot scanner's login, made on the CRM's Team tab (role: Lot scanner).
+  email: "malachhii+scanner@gmail.com",
+  password: "PASTE_THE_SCANNER_PASSWORD_HERE",
+
+  // Your Firebase project (filled in for you).
+  apiKey: "AIzaSyDdSPhAz2sjoHXt_c-UPXv5W-Tq8e94BkA",
+  projectId: "macomb-recall-crm",
+
+  everyHours: 4,       // start a fresh pass over every dealer this often
+  runSeconds: 200,     // stop starting new dealers after this long in one run (Apps Script allows 6 minutes)
+  batch: 8,            // dealers checked side by side
+};
+
+const VERSION = "1.0";
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 NissanRecallLotScanner";
+
+/* =========================== Buttons you can run =========================== */
+
+/** Run once. Checks the settings, turns on the timer and does the first batch. */
+function setup() {
+  checkConfig_();
+  signIn_(true);
+  const dealers = fsList_("dealers", ["name"]);
+  Logger.log("Signed in. The CRM has " + dealers.length + " dealerships. The first run also adds the area's dealers from OpenStreetMap.");
+  PropertiesService.getScriptProperties().deleteProperty("mapSync");
+  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === "scan") ScriptApp.deleteTrigger(t); });
+  ScriptApp.newTrigger("scan").timeBased().everyHours(1).create();
+  Logger.log("Timer is on: the scanner runs every hour and starts a full pass every " + CONFIG.everyHours + " hours.");
+  PropertiesService.getScriptProperties().deleteProperty("state");
+  scan();
+}
+
+/** Turns the timer off. */
+function stopScanner() {
+  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === "scan") ScriptApp.deleteTrigger(t); });
+  Logger.log("Scanner timer is off.");
+}
+
+/** Starts a fresh pass over every dealer on the next run. */
+function startOver() {
+  PropertiesService.getScriptProperties().deleteProperty("state");
+  Logger.log("Next run starts a new pass from the first dealer.");
+}
+
+/** Checks one dealer and prints what it found, without saving. Put a dealer's website between the quotes. */
+function testOneSite() {
+  const site = "https://www.example.com";
+  const job = new DealerJob({ id: "test", name: "Test", website: site }, null);
+  const res = runJobs_([job])[0];
+  Logger.log(JSON.stringify(res, null, 1).slice(0, 8000));
+}
+
+/* =========================== Main run =========================== */
+
+function scan() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(2000)) return;
+  try { scanInner_(); } finally { lock.releaseLock(); }
+}
+
+function scanInner_() {
+  checkConfig_();
+  const t0 = Date.now();
+  const props = PropertiesService.getScriptProperties();
+  let state = {};
+  try { state = JSON.parse(props.getProperty("state") || "{}"); } catch (e) { state = {}; }
+  const now = iso_();
+  signIn_(false);
+
+  let dealers = listDealers_();
+  const status = fsGet_("scanner/status") || {};
+  status.dealers = status.dealers || {};
+
+  // Once a week, add any new dealers in the area from OpenStreetMap.
+  const lastSync = props.getProperty("mapSync");
+  if (!lastSync || Date.now() - Date.parse(lastSync) > 7 * 864e5) {
+    const r = syncDealersFromMap_(dealers);
+    if (r.ok) { props.setProperty("mapSync", now); status.mapSync = { at: now, added: r.added, filled: r.filled, seen: r.seen }; }
+    if (r.added || r.filled) dealers = listDealers_();
+  }
+  const learn = fsGet_("scanner/learn") || {};
+  delete learn.id;
+
+  const due = !state.passStart || (state.passDone && (Date.now() - Date.parse(state.passStart)) / 36e5 >= CONFIG.everyHours);
+  if (due) state = { passStart: now, cursor: 0, passDone: false, pass: (state.pass || 0) + 1 };
+
+  if (!state.passDone) {
+    while (state.cursor < dealers.length && (Date.now() - t0) / 1000 < CONFIG.runSeconds) {
+      const slice = dealers.slice(state.cursor, state.cursor + CONFIG.batch);
+      const prevLots = fsGetMany_(slice.map(function (d) { return "lots/" + d.id; }));
+      const jobs = slice.map(function (d) { return new DealerJob(d, learn[d.id] || null, (status.dealers[d.id] || {})); });
+      const results = runJobs_(jobs);
+      const nissanVins = [];
+      results.forEach(function (r, i) {
+        const prev = prevLots["lots/" + slice[i].id];
+        const known = {}; ((prev && prev.cars) || []).forEach(function (c) { known[c.v] = c; });
+        r.nissan.forEach(function (x) { if (!known[x.vin]) nissanVins.push(x.vin); });
+      });
+      const decoded = decodeVins_(nissanVins);
+      const writes = [];
+      results.forEach(function (r, i) {
+        const d = slice[i];
+        if (r.skipped) return;
+        const prev = prevLots["lots/" + d.id] || null;
+        const merged = mergeLot(prev, r, decoded, now, d);
+        if (merged.changed) writes.push({ path: "lots/" + d.id, data: merged.lot });
+        status.dealers[d.id] = {
+          s: r.status, m: r.method || "", n: merged.lot ? merged.lot.cars.length : 0, a: r.anyCount, t: now,
+          p: r.platform || "", e: r.diag || "", w: d.website || "", rd: r.rd || "",
+        };
+        if (r.learned) learn[d.id] = r.learned; else if (r.status === "ok") delete learn[d.id];
+      });
+      state.cursor += slice.length;
+      const keep = {}; dealers.forEach(function (d) { keep[d.id] = 1; });
+      Object.keys(status.dealers).forEach(function (k) { if (!keep[k]) delete status.dealers[k]; });
+      if (state.cursor >= dealers.length) { state.passDone = true; status.lastPassDone = iso_(); }
+      Object.assign(status, { updated: iso_(), passStart: state.passStart, passDone: !!state.passDone, cursor: state.cursor, total: dealers.length, pass: state.pass || 1, version: VERSION });
+      writes.push({ path: "scanner/status", data: status });
+      writes.push({ path: "scanner/learn", data: learn });
+      fsCommit_(writes);
+      props.setProperty("state", JSON.stringify(state));
+    }
+  }
+
+  // Use leftover time to place dealers on the map and find missing websites.
+  if ((Date.now() - t0) / 1000 < CONFIG.runSeconds + 40) geocodeSome_(dealers, 25);
+  if ((Date.now() - t0) / 1000 < CONFIG.runSeconds + 40) {
+    const n = guessWebsites_(dealers, 30, t0 + (CONFIG.runSeconds + 90) * 1000);
+    if (n) status.webFound = (status.webFound || 0) + n;
+  }
+  status.updated = iso_();
+  fsCommit_([{ path: "scanner/status", data: status }]);
+  props.setProperty("state", JSON.stringify(state));
+}
+
+/* =========================== Finding the inventory =========================== */
+
+const NISSAN_WMI = ["1N4", "1N6", "3N1", "3N6", "3N8", "5N1", "JN1", "JN6", "JN8", "4N2", "5BZ"];
+const VIN_RE = /(?:^|[^A-Za-z0-9])([A-HJ-NPR-Za-hj-npr-z0-9]{17})(?=[^A-Za-z0-9]|$)/g;
+const TRANSLIT = (function () {
+  const m = {}; "0123456789".split("").forEach(function (c, i) { m[c] = i; });
+  [["ABCDEFGH", 1], ["JKLMN", 1], ["P", 7], ["R", 9], ["STUVWXYZ", 2]].forEach(function (g) { g[0].split("").forEach(function (c, i) { m[c] = g[1] + i; }); });
+  return m;
+})();
+const WEIGHTS = [8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2];
+
+function validVin(v) {
+  if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(v)) return false;
+  if (!/[A-HJ-NPR-TV-Y1-9]/.test(v.charAt(9))) return false;
+  let s = 0;
+  for (let i = 0; i < 17; i++) s += TRANSLIT[v.charAt(i)] * WEIGHTS[i];
+  const r = s % 11;
+  return v.charAt(8) === (r === 10 ? "X" : String(r));
+}
+function isNissanVin(v) { return NISSAN_WMI.indexOf(v.slice(0, 3)) >= 0; }
+
+/**
+ * All valid VINs in a block of text, each with a link to its listing when one can be found:
+ * an address containing the VIN (sitemaps, most detail pages), or a "link"/"url" field next to it (JSON).
+ * linkBase is the site origin for relative links; pass "" when there's no page worth linking to.
+ */
+const IMG_RE = /\.(jpe?g|png|webp|gif|svg|avif)(\?|$)/i;
+const LINK_FIELD_RE = /"(?:link|url|vdpUrl|vdp_url|vdpLink|detailUrl|detailsUrl|permalink|href)"\s*:\s*"([^"]{2,400})"/g;
+function findVins(text, pageUrl, linkBase) {
+  const out = {};
+  if (!text) return out;
+  const base = linkBase === undefined ? originOf(pageUrl) : linkBase;
+  const fallback = linkBase === "" ? "" : (pageUrl || "");
+  const inUrl = {};
+  const addUrl = function (u) {
+    if (IMG_RE.test(u)) return;
+    const mm = u.match(/[A-HJ-NPR-Za-hj-npr-z0-9]{17}/g);
+    if (mm) mm.forEach(function (x) { const X = x.toUpperCase(); if (!inUrl[X]) inUrl[X] = u; });
+  };
+  const ure = /https?:\/\/[^\s"'<>\\]+/g; let u;
+  while ((u = ure.exec(text))) addUrl(u[0].replace(/&amp;/g, "&").replace(/[),.;]+$/, ""));
+  if (base) { const hre = /href=["'](\/[^"']+)["']/g; while ((u = hre.exec(text))) addUrl(base + u[1].replace(/&amp;/g, "&")); }
+  VIN_RE.lastIndex = 0;
+  let m;
+  while ((m = VIN_RE.exec(text))) {
+    const v = m[1].toUpperCase();
+    if (out[v] || !validVin(v)) continue;
+    let link = inUrl[v] || "";
+    if (!link) {
+      // JSON: the listing's link field in the same record.
+      const lo = Math.max(0, m.index - 1500), win = text.slice(lo, m.index + 1500);
+      let best = null, f; LINK_FIELD_RE.lastIndex = 0;
+      while ((f = LINK_FIELD_RE.exec(win))) {
+        const val = f[1].replace(/\\\//g, "/");
+        if (IMG_RE.test(val) || !/^(https?:\/\/|\/)/.test(val)) continue;
+        const dist = Math.abs(lo + f.index - m.index);
+        if (!best || dist < best.d) best = { d: dist, v: val };
+      }
+      if (best) link = /^https?:/i.test(best.v) ? best.v : base ? base + best.v : "";
+    }
+    out[v] = { vin: v, url: link || fallback };
+  }
+  return out;
+}
+
+const CHALLENGE_RE = /recaptcha\/challengepage|cf-chl|cf_chl|<title>\s*Just a moment|Attention Required! \| Cloudflare|<title>\s*Access Denied|Request unsuccessful\. Incapsula|_Incapsula_Resource|px-captcha|distil_r_captcha|Pardon Our Interruption/i;
+function isBlocked(r) {
+  if (!r) return false;
+  if (r.code === 403 || r.code === 429 || r.code === 503) return true;
+  return r.code === 200 && r.text.length < 60000 && CHALLENGE_RE.test(r.text);
+}
+
+function fingerprint(html) {
+  const h = html || "";
+  if (/dealeron|\/searchused\.aspx|dlron/i.test(h)) return "dealeron";
+  if (/DDC\.|ddc-|dealer\.com|\/static\/dist\/ddc|ws-inv-/i.test(h)) return "dealer.com";
+  if (/dealerinspire|dealer inspire|di-mod|algolia/i.test(h)) return "dealerinspire";
+  if (/VehicleSearchResults|cdkglobal|sincro|cobalt\.com/i.test(h)) return "cdk";
+  if (/teamvelocity|apollo-|tv-inventory/i.test(h)) return "teamvelocity";
+  if (/dealereprocess|dep-/i.test(h)) return "dealereprocess";
+  if (/overfuel/i.test(h)) return "overfuel";
+  if (/dealercenter|dealer center/i.test(h)) return "dealercenter";
+  if (/carsforsale\.com/i.test(h)) return "carsforsale";
+  if (/dealerfire|dealersocket/i.test(h)) return "dealersocket";
+  if (/wp-content/i.test(h)) return "wordpress";
+  return "";
+}
+
+function parseRobots(text) {
+  const out = { sitemaps: [], rules: [] };
+  if (!text || /<html/i.test(text)) return out;
+  let mine = false, inGroup = false;
+  text.split(/\r?\n/).forEach(function (line) {
+    const l = line.replace(/#.*/, "").trim();
+    if (!l) return;
+    const i = l.indexOf(":"); if (i < 0) return;
+    const k = l.slice(0, i).trim().toLowerCase(), v = l.slice(i + 1).trim();
+    if (k === "sitemap") { if (/^https?:\/\//i.test(v)) out.sitemaps.push(v); return; }
+    if (k === "user-agent") { if (!inGroup) mine = false; inGroup = true; if (v === "*") mine = true; return; }
+    inGroup = false;
+    if (mine && (k === "disallow" || k === "allow") && v) out.rules.push({ allow: k === "allow", path: v });
+  });
+  return out;
+}
+function robotsAllows(robots, url) {
+  if (!robots || !robots.rules.length) return true;
+  const m = url.match(/^https?:\/\/[^\/]+(\/[^#]*)?/i); const path = (m && m[1]) || "/";
+  let best = null;
+  robots.rules.forEach(function (r) {
+    const re = new RegExp("^" + r.path.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\\\$$/, "$"));
+    if (re.test(path) && (!best || r.path.length > best.path.length || (r.path.length === best.path.length && r.allow))) best = r;
+  });
+  return !best || best.allow;
+}
+
+function sitemapLinks(xml) {
+  const out = { children: [], isIndex: /<sitemapindex/i.test(xml || "") };
+  if (!xml) return out;
+  if (out.isIndex) {
+    const re = /<loc>\s*([^<\s]+)\s*<\/loc>/gi; let m;
+    while ((m = re.exec(xml))) out.children.push(m[1].replace(/&amp;/g, "&"));
+  }
+  return out;
+}
+function rankSitemap(u) {
+  const s = u.toLowerCase();
+  if (/inventory|vehicle|vdp|used|preowned|pre-owned|cars|listing|stock|new/.test(s)) return 0;
+  if (/page|post|blog|categor|tag|author|attachment|image|video|news|special|model|research|service/.test(s)) return 2;
+  return 1;
+}
+
+function originOf(url) {
+  let u = String(url || "").trim();
+  if (!u) return "";
+  if (!/^https?:\/\//i.test(u)) u = "https://" + u;
+  const m = u.match(/^(https?:\/\/[^\/?#]+)/i);
+  return m ? m[1].toLowerCase().replace(/^http:/, "https:") : "";
+}
+
+function ddcParams(html) {
+  const pick = function (re) { const m = (html || "").match(re); return m ? m[1] : ""; };
+  return {
+    siteId: pick(/"siteId"\s*:\s*"([^"]+)"/) || pick(/siteId\s*[:=]\s*['"]([^'"]+)['"]/),
+    pageId: pick(/"pageId"\s*:\s*"(v9_[^"]+)"/) || pick(/(v9_INVENTORY_SEARCH_RESULTS[A-Z0-9_]*)/),
+    pageAlias: pick(/"pageAlias"\s*:\s*"(INVENTORY_LISTING[^"]+)"/),
+    windowId: pick(/"windowId"\s*:\s*"(inventory-data-bus\d*)"/) || pick(/(inventory-data-bus\d)/),
+  };
+}
+function ddcRequests(base, p) {
+  if (!p.siteId) return [];
+  const make = function (alias, pageId) {
+    return {
+      url: base + "/api/widget/ws-inv-data/getInventory", method: "post", contentType: "application/json",
+      payload: JSON.stringify({
+        siteId: p.siteId, locale: "en_US", device: "DESKTOP", pageAlias: alias, pageId: pageId,
+        windowId: p.windowId || "inventory-data-bus2", widgetName: "ws-inv-data",
+        inventoryParameters: { make: ["Nissan"] }, preferences: { pageSize: "100", rows: "100" }, includePricing: false,
+      }),
+    };
+  };
+  const out = [];
+  if (p.pageId) out.push(make(p.pageAlias || "INVENTORY_LISTING_DEFAULT_AUTO_USED", p.pageId));
+  out.push(make("INVENTORY_LISTING_DEFAULT_AUTO_ALL", "v9_INVENTORY_SEARCH_RESULTS_AUTO_ALL_V1_1"));
+  out.push(make("INVENTORY_LISTING_DEFAULT_AUTO_USED", "v9_INVENTORY_SEARCH_RESULTS_AUTO_USED_V1_1"));
+  return out;
+}
+
+function algoliaParams(html) {
+  const h = html || "";
+  const pick = function (re) { const m = h.match(re); return m ? m[1] : ""; };
+  const appId = pick(/["']?(?:applicationId|appId|algoliaAppId|algolia_app_id|app_id)["']?\s*[:=]\s*["']([A-Z0-9]{10})["']/i);
+  const apiKey = pick(/["']?(?:apiKey|searchApiKey|searchKey|algoliaApiKey|algolia_search_key|api_key|search_api_key)["']?\s*[:=]\s*["']([a-f0-9]{32})["']/i);
+  const idx = [];
+  const re = /["']([A-Za-z0-9_\-]*(?:inventory|vehicles)[A-Za-z0-9_\-]*)["']/g; let m;
+  while ((m = re.exec(h)) && idx.length < 4) { if (/_|-/.test(m[1]) && idx.indexOf(m[1]) < 0 && m[1].length < 80) idx.push(m[1]); }
+  return { appId: appId, apiKey: apiKey, indexes: idx };
+}
+function algoliaRequests(p) {
+  if (!p.appId || !p.apiKey || !p.indexes.length) return [];
+  return [{
+    url: "https://" + p.appId.toLowerCase() + "-dsn.algolia.net/1/indexes/*/queries", method: "post", contentType: "application/json",
+    headers: { "X-Algolia-Application-Id": p.appId, "X-Algolia-API-Key": p.apiKey },
+    payload: JSON.stringify({ requests: p.indexes.map(function (ix) { return { indexName: ix, params: "query=nissan&hitsPerPage=500" }; }) }),
+  }];
+}
+
+const PAGE_PATHS = {
+  "dealer.com": ["/used-inventory/index.htm"],
+  "dealerinspire": ["/used-vehicles/"],
+  "cdk": ["/VehicleSearchResults?search=preowned&make=Nissan"],
+  "teamvelocity": ["/inventory/used?make=Nissan"],
+  "dealereprocess": ["/inventory/used/?make=Nissan"],
+  "overfuel": ["/used-vehicles?make=Nissan"],
+  "dealercenter": ["/inventory?make=Nissan"],
+  "carsforsale": ["/inventory?make=Nissan"],
+  "dealersocket": ["/inventory/used?make=Nissan"],
+  "": ["/inventory?make=Nissan", "/used-vehicles/?make=Nissan", "/inventory/used?make=Nissan", "/cars-for-sale?make=Nissan", "/used-cars?make=Nissan", "/inventory/"],
+};
+PAGE_PATHS.wordpress = PAGE_PATHS[""];
+
+/**
+ * One dealer's scan, as a few rounds of web requests. Each round's requests for every dealer in a
+ * batch go out together.
+ */
+function DealerJob(d, learned, prevStatus) {
+  this.d = d; this.learned = learned; this.prev = prevStatus || {};
+  this.base = originOf(d.website || d.inv || "");
+  this.vins = {}; this.codes = []; this.blocked = 0; this.reached = 0;
+  this.platform = ""; this.robots = null; this.seen = {}; this.found = [];
+  this.phase = "start"; this.round = 0; this.diag = [];
+}
+DealerJob.prototype.start = function () {
+  if (!this.base) { this.phase = "done"; return []; }
+  // A site that couldn't be read is tried again about once a day, unless its website was changed.
+  const p = this.prev;
+  if (!this.learned && p.s && p.s !== "ok" && p.s !== "nosite" && p.t && (p.w || "") === (this.d.website || "") &&
+      Date.now() - Date.parse(p.t) < 20 * 36e5) { this.skipped = true; this.phase = "done"; return []; }
+  if (this.learned && this.learned.r && this.learned.r.length && this.learned.b === this.base) { this.phase = "fast"; return this.learned.r.map(fromSpec_); }
+  return this.discover_();
+};
+DealerJob.prototype.discover_ = function () {
+  this.phase = "discover";
+  const b = this.base, reqs = [{ url: b + "/" }, { url: b + "/robots.txt" }, { url: b + "/sitemap.xml" }];
+  if (this.d.inv && /^https?:/i.test(this.d.inv)) reqs.push({ url: this.d.inv });
+  return reqs;
+};
+DealerJob.prototype.take_ = function (req, r, tag) {
+  this.codes.push(r ? r.code : 0);
+  if (!r || !r.code) return 0;
+  if (isBlocked(r)) { this.blocked++; return 0; }
+  if (r.code >= 200 && r.code < 300) this.reached++;
+  if (r.code !== 200) return 0;
+  const found = req.method === "post" ? findVins(r.text, "", /algolia/.test(req.url) ? "" : this.base) : findVins(r.text, req.url);
+  const keys = Object.keys(found);
+  keys.forEach(function (v) { if (!this.vins[v]) this.vins[v] = found[v]; }.bind(this));
+  if (keys.length >= 3 && tag) this.found.push({ tag: tag, req: req, n: keys.length });
+  return keys.length;
+};
+DealerJob.prototype.step = function (reqs, resps) {
+  this.round++;
+  const self = this, b = this.base;
+  if (this.phase === "fast") {
+    reqs.forEach(function (q, i) { self.take_(q, resps[i], "fast"); });
+    if (Object.keys(this.vins).length >= 3) { this.method = this.learned.m; this.keepLearned = true; this.phase = "done"; return []; }
+    // The learned way stopped working. Look again, at most once a day.
+    if (this.prev.rd && Date.now() - Date.parse(this.prev.rd) < 20 * 36e5) { this.phase = "done"; return []; }
+    this.rediscovered = true;
+    return this.discover_();
+  }
+  if (this.phase === "discover") {
+    const home = resps[0], robots = resps[1], sm = resps[2];
+    this.take_(reqs[0], home, "page");
+    this.homeHtml = home && home.code === 200 ? home.text : "";
+    this.platform = fingerprint(this.homeHtml);
+    this.robots = robots && robots.code === 200 ? parseRobots(robots.text) : null;
+    this.take_(reqs[2], sm, "sitemap");
+    if (reqs[3]) this.take_(reqs[3], resps[3], "page");
+    const next = [];
+    let children = sitemapLinks(sm && sm.code === 200 ? sm.text : "").children;
+    if (this.robots) children = children.concat(this.robots.sitemaps.filter(function (u) { return !/\/sitemap\.xml$/i.test(u) || originOf(u) !== b; }));
+    children = uniq_(children).filter(function (u) { return /^https?:/i.test(u); })
+      .sort(function (x, y) { return rankSitemap(x) - rankSitemap(y); }).filter(function (u) { return rankSitemap(u) < 2; }).slice(0, 6);
+    children.forEach(function (u) { self.seen[u] = 1; next.push({ url: u, tag: "sitemap" }); });
+    if (Object.keys(this.vins).length < 3 || this.platform === "dealer.com" || this.platform === "dealerinspire") {
+      (PAGE_PATHS[this.platform] || PAGE_PATHS[""]).forEach(function (p) {
+        const u = b + p; if (self.robots && !robotsAllows(self.robots, u)) { self.diag.push("robots blocks " + p); return; }
+        next.push({ url: u, tag: "page" });
+      });
+      if (this.platform === "dealer.com") ddcRequests(b, ddcParams(this.homeHtml)).slice(0, 1).forEach(function (q) { q.tag = "ddc"; next.push(q); });
+      algoliaRequests(algoliaParams(this.homeHtml)).forEach(function (q) { q.tag = "algolia"; next.push(q); });
+    }
+    this.phase = "r2";
+    if (!next.length) { this.phase = "done"; return []; }
+    return next;
+  }
+  if (this.phase === "r2") {
+    const next = [];
+    reqs.forEach(function (q, i) {
+      const r = resps[i];
+      self.take_(q, r, q.tag);
+      if (!r || r.code !== 200) return;
+      if (q.tag === "sitemap") {
+        sitemapLinks(r.text).children.filter(function (u) { return !self.seen[u] && rankSitemap(u) < 2; })
+          .sort(function (x, y) { return rankSitemap(x) - rankSitemap(y); }).slice(0, 4)
+          .forEach(function (u) { self.seen[u] = 1; next.push({ url: u, tag: "sitemap" }); });
+      }
+      if (q.tag === "page") {
+        if (self.platform === "dealer.com" || /DDC\./.test(r.text)) {
+          const p = ddcParams(r.text); if (!p.siteId) p.siteId = ddcParams(self.homeHtml).siteId;
+          ddcRequests(self.base, p).forEach(function (x) { x.tag = "ddc"; next.push(x); });
+        }
+        algoliaRequests(algoliaParams(r.text)).forEach(function (x) { x.tag = "algolia"; next.push(x); });
+      }
+    });
+    this.phase = "r3";
+    const want = Object.keys(this.vins).length < 3;
+    const extra = uniqReq_(next.filter(function (q) { return q.tag === "sitemap" || want; }));
+    if (!extra.length) { this.phase = "done"; return []; }
+    return extra.slice(0, 6);
+  }
+  if (this.phase === "r3") {
+    reqs.forEach(function (q, i) { self.take_(q, resps[i], q.tag); });
+    this.phase = "done";
+    return [];
+  }
+  this.phase = "done";
+  return [];
+};
+DealerJob.prototype.result = function () {
+  if (this.skipped) return { skipped: true, status: this.prev.s, nissan: [], anyCount: this.prev.a || 0 };
+  const all = Object.keys(this.vins);
+  const nissan = all.filter(isNissanVin).map(function (v) { return this.vins[v]; }.bind(this));
+  let status;
+  if (!this.base) status = "nosite";
+  else if (all.length >= 3) status = "ok";
+  else if (this.blocked && !this.reached) status = "blocked";
+  else if (!this.reached) status = "error";
+  else status = "unreadable";
+  const res = { status: status, platform: this.platform, anyCount: all.length, nissan: nissan, method: this.method || "" };
+  if (status === "ok") {
+    if (this.keepLearned) res.learned = this.learned;
+    else {
+      const best = {};
+      this.found.forEach(function (f) { (best[f.tag] = best[f.tag] || []).push(f); });
+      const order = ["sitemap", "ddc", "algolia", "page", "fast"];
+      const tag = order.filter(function (t) { return best[t]; })[0];
+      if (tag) {
+        res.method = tag;
+        res.learned = { m: tag, b: this.base, r: best[tag].sort(function (x, y) { return y.n - x.n; }).slice(0, tag === "sitemap" ? 4 : 2).map(function (f) { return toSpec_(f.req); }) };
+        if (tag === "sitemap" && best.page) res.learned.r = res.learned.r.concat(best.page.slice(0, 1).map(function (f) { return toSpec_(f.req); }));
+      }
+    }
+  }
+  if (status !== "ok") {
+    const codes = this.codes.filter(function (c) { return c; });
+    res.diag = (this.platform ? this.platform + " · " : "") + "HTTP " + (codes.length ? uniq_(codes.map(String)).join("/") : "no answer") +
+      (this.blocked ? " · bot check" : "") + (this.diag.length ? " · " + this.diag.slice(0, 2).join(", ") : "");
+  }
+  if (this.rediscovered) res.rd = iso_();
+  return res;
+};
+function toSpec_(q) { const s = { u: q.url }; if (q.method) s.x = q.method; if (q.payload) s.b = q.payload; if (q.headers) s.h = q.headers; if (q.contentType) s.c = q.contentType; return s; }
+function fromSpec_(s) { const q = { url: s.u }; if (s.x) q.method = s.x; if (s.b) q.payload = s.b; if (s.h) q.headers = s.h; if (s.c) q.contentType = s.c; return q; }
+function uniq_(a) { const s = {}; return a.filter(function (x) { if (s[x]) return false; s[x] = 1; return true; }); }
+function uniqReq_(a) { const s = {}; return a.filter(function (q) { const k = q.url + "|" + (q.payload || ""); if (s[k]) return false; s[k] = 1; return true; }); }
+
+/** Runs a set of DealerJobs together, round by round. */
+function runJobs_(jobs) {
+  let pending = jobs.map(function (j) { return { job: j, reqs: j.start() }; });
+  for (let round = 0; round < 6; round++) {
+    pending = pending.filter(function (p) { return p.reqs.length; });
+    if (!pending.length) break;
+    const flat = []; pending.forEach(function (p) { p.reqs.forEach(function (q) { flat.push(q); }); });
+    const resps = http_(flat);
+    let k = 0;
+    pending.forEach(function (p) {
+      const mine = resps.slice(k, k + p.reqs.length); k += p.reqs.length;
+      p.reqs = p.job.step(p.reqs, mine);
+    });
+  }
+  return jobs.map(function (j) { if (j.phase !== "done") j.phase = "done"; const r = j.result(); if (j.prev && j.prev.rd && !r.rd) r.rd = j.prev.rd; return r; });
+}
+
+/* =========================== Finding dealers =========================== */
+
+// The area on your map: Flint and Lapeer down to Monroe and Adrian, Howell and Ann Arbor east to the St. Clair River.
+const AREA = { s: 41.80, w: -84.30, n: 43.12, e: -82.40 };
+const OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter", "https://maps.mail.ru/osm/tools/overpass/api/interpreter"];
+// The Canadian border (St. Clair River, Lake St. Clair, Detroit River), north to south: [lat, lon].
+const BORDER = [[43.12, -82.42], [42.99, -82.42], [42.90, -82.46], [42.80, -82.48], [42.62, -82.52], [42.55, -82.62], [42.45, -82.80], [42.36, -82.90], [42.33, -82.98], [42.30, -83.06], [42.25, -83.10], [42.18, -83.13], [42.05, -83.15], [41.70, -83.15]];
+const BRAND_WORDS = ["acura", "alfa", "romeo", "audi", "bmw", "buick", "cadillac", "chevrolet", "chevy", "chrysler", "dodge", "fiat", "ford", "genesis", "gmc", "honda", "hyundai", "jaguar", "jeep", "kia", "land", "rover", "lexus", "lincoln", "mazda", "mercedes", "benz", "mini", "mitsubishi", "porsche", "ram", "subaru", "tesla", "toyota", "volkswagen", "vw", "volvo", "maserati", "ferrari", "polestar", "rivian", "lucid", "general", "motors"];
+const NOT_A_LOT = /nissan|infiniti|junk|towing|tow\b|auction|salvage|scrap|parts|body shop|collision|service center|tire|carhartt|rv\b|traveland|camper|motorsports|powersports|harley|cycle|marine|boat|trailer|rental|rent-a|limo/i;
+
+function inCanada(lat, lon, tags) {
+  tags = tags || {};
+  const st = String(tags["addr:state"] || "").toUpperCase();
+  if (st === "ON" || st === "ONTARIO" || /^[A-Z]\d[A-Z]/i.test(String(tags["addr:postcode"] || ""))) return true;
+  if (st === "MI" || st === "MICHIGAN") return false;
+  for (let i = 0; i < BORDER.length - 1; i++) {
+    const a = BORDER[i], b = BORDER[i + 1];
+    if (lat <= a[0] && lat >= b[0]) { const t = (lat - b[0]) / (a[0] - b[0] || 1); return lon > b[1] + t * (a[1] - b[1]); }
+  }
+  return false;
+}
+function normName(n) {
+  return String(n || "").toLowerCase().replace(/&/g, " and ").replace(/['’`.]/g, "").replace(/[^a-z0-9]+/g, " ")
+    .replace(/\b(inc|llc|co|corp|company|the|of|and|dealership)\b/g, " ").replace(/\s+/g, " ").trim();
+}
+function nameKey(n) { return normName(n).replace(/\b(sales|auto|motors|cars|used|pre owned|preowned|super center|center|superstore|group)\b/g, "").replace(/\s+/g, " ").trim(); }
+function onlyBrand(n) { const t = normName(n).split(" ").filter(Boolean); return t.length > 0 && t.every(function (w) { return BRAND_WORDS.indexOf(w) >= 0 || w === "dealer"; }); }
+function fmtPhone(p) { const d = String(p || "").split(";")[0].replace(/\D/g, ""); const t = d.length === 11 && d[0] === "1" ? d.slice(1) : d; return t.length === 10 ? "(" + t.slice(0, 3) + ") " + t.slice(3, 6) + "-" + t.slice(6) : ""; }
+function slug_(s) { return String(s || "").toLowerCase().replace(/['’]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60); }
+function milesBetween(a, b) {
+  const r = function (x) { return x * Math.PI / 180; }, dLat = r(b[0] - a[0]), dLon = r(b[1] - a[1]);
+  const h = Math.pow(Math.sin(dLat / 2), 2) + Math.cos(r(a[0])) * Math.cos(r(b[0])) * Math.pow(Math.sin(dLon / 2), 2);
+  return 7917.6 * Math.asin(Math.sqrt(h));
+}
+
+/** Turns OpenStreetMap car-dealer records into new dealer entries, skipping ones the CRM already has. */
+function dealersFromMap(elements, existing, today) {
+  const have = existing.map(function (d) { return { id: d.id, k: nameKey(d.name), ll: typeof d.lat === "number" ? [d.lat, d.lon] : null, osm: d.osm || "", d: d }; });
+  const takenIds = {}; existing.forEach(function (d) { takenIds[d.id] = 1; });
+  const out = [], fills = [];
+  (elements || []).forEach(function (el) {
+    const t = el.tags || {}, name = String(t.name || "").trim();
+    const lat = el.lat != null ? el.lat : el.center && el.center.lat, lon = el.lon != null ? el.lon : el.center && el.center.lon;
+    if (!name || lat == null || lon == null) return;
+    if (lat < AREA.s || lat > AREA.n || lon < AREA.w || lon > AREA.e || inCanada(lat, lon, t)) return;
+    if (NOT_A_LOT.test(name) || NOT_A_LOT.test(t.brand || "") || onlyBrand(name)) return;
+    const k = nameKey(name); if (!k) return;
+    const osm = el.type + "/" + el.id, ll = [Math.round(lat * 1e5) / 1e5, Math.round(lon * 1e5) / 1e5];
+    const web = t.website || t["contact:website"] || t.url || "";
+    const match = have.filter(function (h) { return h.osm === osm || (h.k === k && (!h.ll || milesBetween(h.ll, ll) < 1.5)); })[0];
+    if (match) {
+      // Fill in what the existing entry is missing.
+      const f = {};
+      if (!match.d.website && /^https?:\/\//i.test(web)) f.website = web;
+      if (!match.ll) { f.lat = ll[0]; f.lon = ll[1]; match.ll = ll; }
+      if (!match.d.osm) f.osm = osm;
+      if (Object.keys(f).length) { fills.push({ id: match.id, f: f }); Object.assign(match.d, f); }
+      return;
+    }
+    const city = t["addr:city"] || "";
+    let id = "d-" + slug_(name + (city ? "-" + city : "-" + el.id)), n = 2;
+    while (takenIds[id]) id = "d-" + slug_(name + "-" + (city || el.id)) + "-" + n++;
+    takenIds[id] = 1;
+    const ph = fmtPhone(t.phone || t["contact:phone"]);
+    const d = {
+      name: name, brands: String(t.brand || "").split(/[;,]/).map(function (s) { return s.trim(); }).filter(function (s) { return s && !/general motors/i.test(s); }),
+      website: /^https?:\/\//i.test(web) ? web : null, phones: ph ? [{ t: "Main", n: ph }] : [],
+      addr: [t["addr:housenumber"], t["addr:street"]].filter(Boolean).join(" "), city: city, state: "MI", zip: String(t["addr:postcode"] || "").slice(0, 5),
+      lat: ll[0], lon: ll[1], osm: osm, source: "OpenStreetMap", checked: today, addedBy: "Lot scanner",
+      usedOnly: t.second_hand === "only",
+    };
+    out.push({ id: id, d: d });
+    have.push({ id: id, k: k, ll: ll, osm: osm, d: d });
+  });
+  return { add: out, fill: fills };
+}
+
+/** Weekly: asks OpenStreetMap for every car dealer in the area and adds the new ones to the CRM. */
+function syncDealersFromMap_(dealers) {
+  const q = "[out:json][timeout:120];nwr[\"shop\"=\"car\"][\"name\"](" + [AREA.s, AREA.w, AREA.n, AREA.e].join(",") + ");out center tags;";
+  let els = null;
+  for (let i = 0; i < OVERPASS.length && !els; i++) {
+    try {
+      const r = UrlFetchApp.fetch(OVERPASS[i], { method: "post", payload: { data: q }, muteHttpExceptions: true, headers: { "User-Agent": UA } });
+      if (r.getResponseCode() === 200) els = JSON.parse(r.getContentText()).elements || null;
+    } catch (e) { Logger.log("Map data: " + e); }
+  }
+  if (!els) return { ok: false, added: 0, filled: 0 };
+  const res = dealersFromMap(els, dealers, iso_().slice(0, 10));
+  const writes = res.add.map(function (x) { return { path: "dealers/" + x.id, data: x.d, mustBeNew: true }; })
+    .concat(res.fill.map(function (x) { return { path: "dealers/" + x.id, data: x.f, fields: Object.keys(x.f) }; }));
+  if (writes.length) {
+    try { fsCommit_(writes); }
+    catch (e) { writes.forEach(function (w) { try { fsCommit_([w]); } catch (x) { Logger.log("Skipped " + w.path + ": " + String(x).slice(0, 120)); } }); }
+  }
+  Logger.log("Map data: " + els.length + " records, " + res.add.length + " new dealers, " + res.fill.length + " filled in.");
+  return { ok: true, added: res.add.length, filled: res.fill.length, seen: els.length };
+}
+
+/** Tries the obvious web addresses for dealers without a website, and keeps one only if the page names the dealer and its town. */
+function websiteGuesses(d) {
+  const base = normName(d.name).replace(/\b(chrysler dodge jeep ram|chrysler jeep dodge ram|dodge chrysler jeep ram|chrysler dodge jeep)\b/g, "cdjr");
+  const words = base.split(" ").filter(Boolean);
+  const city = normName(d.city || "").replace(/\s/g, "");
+  const squash = words.join("");
+  const noCity = city && squash.endsWith(city) ? squash.slice(0, -city.length) : "";
+  const c = [squash + ".com", squash + ".net"];
+  if (noCity && noCity.length > 5) c.push(noCity + ".com");
+  if (words.length > 2) c.push(words.filter(function (w) { return ["auto", "sales", "motors", "inc"].indexOf(w) < 0; }).join("") + ".com");
+  return uniq_(c).filter(function (x) { return x.length > 8 && x.length < 64; }).slice(0, 4).map(function (x) { return "https://www." + x + "/"; });
+}
+function pageNamesDealer(html, d) {
+  const h = String(html || "").toLowerCase(); if (h.length < 500) return false;
+  const tokens = normName(d.name).split(" ").filter(function (w) { return w.length >= 3 && BRAND_WORDS.indexOf(w) < 0 && ["auto", "sales", "motors", "cars", "used"].indexOf(w) < 0; });
+  if (!tokens.length) return false;
+  const hits = tokens.filter(function (w) { return h.indexOf(w) >= 0; }).length;
+  const ph = ((d.phones || [])[0] || {}).n || "", tail = String(ph).replace(/\D/g, "").slice(-7);
+  const local = (d.city && h.indexOf(String(d.city).toLowerCase()) >= 0) || (d.zip && h.indexOf(String(d.zip)) >= 0) || (tail.length === 7 && h.replace(/\D/g, "").indexOf(tail) >= 0);
+  return hits >= Math.ceil(tokens.length / 2) && local && /michigan|\bmi\b/.test(h);
+}
+function guessWebsites_(dealers, max, deadline) {
+  const tried = fsGet_("scanner/web") || {}; delete tried.id;
+  const todo = dealers.filter(function (d) {
+    if (d.website || !d.name || !d.city) return false;
+    const t = tried[d.id]; return !t || Date.now() - Date.parse(t.t) > 30 * 864e5;
+  }).slice(0, max);
+  if (!todo.length) return 0;
+  let found = 0;
+  const writes = [];
+  for (let i = 0; i < todo.length && Date.now() < deadline; i += 6) {
+    const group = todo.slice(i, i + 6);
+    const reqs = [], owner = [];
+    group.forEach(function (d) { websiteGuesses(d).forEach(function (u) { reqs.push({ url: u }); owner.push(d); }); });
+    const resps = http_(reqs);
+    const hit = {};
+    resps.forEach(function (r, k) {
+      const d = owner[k];
+      if (!hit[d.id] && r && r.code === 200 && !isBlocked(r) && pageNamesDealer(r.text, d)) hit[d.id] = reqs[k].url;
+    });
+    group.forEach(function (d) {
+      tried[d.id] = { t: iso_(), hit: hit[d.id] || "" };
+      if (hit[d.id]) { found++; d.website = hit[d.id]; writes.push({ path: "dealers/" + d.id, data: { website: hit[d.id], webGuess: true }, fields: ["website", "webGuess"] }); }
+    });
+  }
+  writes.push({ path: "scanner/web", data: tried });
+  fsCommit_(writes);
+  return found;
+}
+
+/* =========================== Saving what changed =========================== */
+
+/** Combines this scan with the dealer's previous lot: new arrivals, cars that left, decoded details. */
+function mergeLot(prev, res, decoded, now, dealer) {
+  const ok = res.status === "ok";
+  const prevCars = (prev && prev.cars) || [];
+  if (!ok) return { lot: prev, changed: false };
+  const byVin = {}; prevCars.forEach(function (c) { byVin[c.v] = c; });
+  const since = (prev && prev.since) || now;
+  const cars = res.nissan.map(function (x) {
+    const old = byVin[x.vin];
+    const info = decoded[x.vin] || {};
+    const c = old ? Object.assign({}, old) : { v: x.vin, f: prev ? now : since };
+    if (!c.y && (info.y || yearFromVin(x.vin))) c.y = info.y || yearFromVin(x.vin);
+    if (!c.md && info.md) c.md = info.md;
+    if (!c.tr && info.tr) c.tr = info.tr;
+    if (x.url && x.url !== c.u) c.u = x.url;
+    return c;
+  }).filter(function (c) { return !c.md || !decoded[c.v] || decoded[c.v].mk === "NISSAN"; });
+  const nowVins = {}; cars.forEach(function (c) { nowVins[c.v] = 1; });
+  const cutoff = Date.parse(now) - 30 * 864e5;
+  let gone = ((prev && prev.gone) || []).filter(function (g) { return !nowVins[g.v] && Date.parse(g.g) > cutoff; });
+  prevCars.forEach(function (c) { if (!nowVins[c.v]) gone.unshift({ v: c.v, y: c.y || null, md: c.md || "", tr: c.tr || "", f: c.f, g: now }); });
+  gone = gone.slice(0, 40);
+  const lot = { dealer: dealer.id, name: dealer.name || "", since: since, cars: cars, gone: gone, updatedAt: now };
+  const sig = function (l) { return JSON.stringify([(l.cars || []).map(function (c) { return [c.v, c.md, c.y, c.u]; }), (l.gone || []).map(function (g) { return g.v; })]); };
+  const changed = !prev || sig(prev) !== sig(lot);
+  if (!changed) lot.updatedAt = prev.updatedAt;
+  return { lot: lot, changed: changed };
+}
+
+const YEAR_CODES = "ABCDEFGHJKLMNPRSTVWXY123456789";
+function yearFromVin(v) {
+  const i = YEAR_CODES.indexOf(v.charAt(9)); if (i < 0) return null;
+  let y = 1980 + i; const nowY = new Date().getFullYear() + 1;
+  while (y + 30 <= nowY) y += 30;
+  return y;
+}
+
+/** Year, model and trim from NHTSA's free VIN decoder, 50 at a time. */
+function decodeVins_(vins) {
+  const out = {};
+  vins = uniq_(vins);
+  for (let i = 0; i < vins.length; i += 50) {
+    const chunk = vins.slice(i, i + 50);
+    try {
+      const r = UrlFetchApp.fetch("https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVINValuesBatch/", {
+        method: "post", payload: { format: "json", data: chunk.join(";") }, muteHttpExceptions: true,
+      });
+      if (r.getResponseCode() !== 200) continue;
+      (JSON.parse(r.getContentText()).Results || []).forEach(function (x) {
+        const v = String(x.VIN || "").toUpperCase(); if (!v) return;
+        out[v] = { mk: String(x.Make || "").toUpperCase(), md: x.Model || "", y: Number(x.ModelYear) || null, tr: x.Trim || x.Series || "" };
+      });
+    } catch (e) { Logger.log("VIN decoder: " + e); }
+  }
+  return out;
+}
+
+/** Puts dealers without map coordinates on the map, using the US Census address lookup. */
+function geocodeSome_(dealers, max) {
+  const geo = fsGet_("scanner/geo") || {}; delete geo.id;
+  const todo = dealers.filter(function (d) {
+    if (typeof d.lat === "number" && typeof d.lon === "number") return false;
+    if (!d.addr || !d.city) return false;
+    const g = geo[d.id]; return !g || (g.miss && Date.now() - Date.parse(g.t) > 7 * 864e5);
+  }).slice(0, max);
+  if (!todo.length) return;
+  const reqs = todo.map(function (d) {
+    const q = [d.addr, d.city, d.state || "MI", d.zip || ""].join(", ");
+    return { url: "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?benchmark=Public_AR_Current&format=json&address=" + encodeURIComponent(q) };
+  });
+  const resps = http_(reqs);
+  todo.forEach(function (d, i) {
+    const r = resps[i]; let hit = null;
+    try { const m = JSON.parse(r.text).result.addressMatches[0]; if (m) hit = [Math.round(m.coordinates.y * 1e5) / 1e5, Math.round(m.coordinates.x * 1e5) / 1e5]; } catch (e) {}
+    geo[d.id] = hit ? { ll: hit, t: iso_() } : { miss: true, t: iso_() };
+  });
+  fsCommit_([{ path: "scanner/geo", data: geo }]);
+}
+
+/* =========================== Web requests =========================== */
+
+function http_(reqs) {
+  if (!reqs.length) return [];
+  const opts = reqs.map(function (q) {
+    const o = {
+      url: q.url, method: q.method || "get", muteHttpExceptions: true, followRedirects: true, validateHttpsCertificates: true,
+      headers: Object.assign({ "User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7", "Accept-Language": "en-US,en;q=0.9" }, q.headers || {}),
+    };
+    if (q.payload) o.payload = q.payload;
+    if (q.contentType) o.contentType = q.contentType;
+    return o;
+  });
+  const wrap = function (r) {
+    let text = ""; try { text = r.getContentText(); } catch (e) { text = ""; }
+    if (text.length > 6e6) text = text.slice(0, 6e6);
+    return { code: r.getResponseCode(), text: text };
+  };
+  try {
+    return UrlFetchApp.fetchAll(opts).map(wrap);
+  } catch (e) {
+    // One bad address fails the whole group, so retry one by one.
+    return opts.map(function (o) { try { return wrap(UrlFetchApp.fetch(o.url, o)); } catch (x) { return { code: 0, text: "", err: String(x).slice(0, 120) }; } });
+  }
+}
+
+/* =========================== Firebase =========================== */
+
+function checkConfig_() {
+  const placeholder = function (v) { return !v || /^(PASTE|SCANNER|FIREBASE)/.test(String(v)); };
+  if (placeholder(CONFIG.password) || placeholder(CONFIG.email) || placeholder(CONFIG.apiKey) || placeholder(CONFIG.projectId)) {
+    throw new Error("Fill in the scanner's email and password at the top of this file, then save and run setup again.");
+  }
+}
+
+let TOKEN_ = null;
+function signIn_(fresh) {
+  const cache = CacheService.getScriptCache();
+  if (!fresh) { const t = cache.get("idToken"); if (t) { TOKEN_ = t; return t; } }
+  const r = UrlFetchApp.fetch("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + CONFIG.apiKey, {
+    method: "post", contentType: "application/json", muteHttpExceptions: true,
+    payload: JSON.stringify({ email: CONFIG.email, password: CONFIG.password, returnSecureToken: true }),
+  });
+  const j = JSON.parse(r.getContentText() || "{}");
+  if (r.getResponseCode() !== 200) {
+    const msg = (j.error && j.error.message) || ("HTTP " + r.getResponseCode());
+    throw new Error("Couldn't sign in as the lot scanner (" + msg + "). Check the email and password at the top of this file.");
+  }
+  TOKEN_ = j.idToken;
+  cache.put("idToken", TOKEN_, 50 * 60);
+  return TOKEN_;
+}
+
+function fsBase_() { return "https://firestore.googleapis.com/v1/projects/" + CONFIG.projectId + "/databases/(default)/documents"; }
+function fsName_(path) { return "projects/" + CONFIG.projectId + "/databases/(default)/documents/" + path; }
+function fsCall_(method, url, body) {
+  const o = { method: method, muteHttpExceptions: true, headers: { Authorization: "Bearer " + (TOKEN_ || signIn_(false)) }, contentType: "application/json" };
+  if (body) o.payload = JSON.stringify(body);
+  let r = UrlFetchApp.fetch(url, o);
+  if (r.getResponseCode() === 401) { signIn_(true); o.headers.Authorization = "Bearer " + TOKEN_; r = UrlFetchApp.fetch(url, o); }
+  const code = r.getResponseCode(), text = r.getContentText();
+  if (code === 404) return null;
+  if (code >= 300) {
+    if (code === 403) throw new Error("The database refused the scanner (" + text.slice(0, 160) + "). Make sure its Team entry has the Lot scanner role and the new security rules are published.");
+    throw new Error("Database error " + code + ": " + text.slice(0, 300));
+  }
+  return text ? JSON.parse(text) : {};
+}
+function fsList_(coll, fields) {
+  const out = []; let token = "";
+  do {
+    let url = fsBase_() + "/" + coll + "?pageSize=300" + (token ? "&pageToken=" + encodeURIComponent(token) : "");
+    (fields || []).forEach(function (f) { url += "&mask.fieldPaths=" + encodeURIComponent(f); });
+    const j = fsCall_("get", url) || {};
+    (j.documents || []).forEach(function (d) { out.push(fromDoc_(d)); });
+    token = j.nextPageToken || "";
+  } while (token);
+  return out;
+}
+function fsGet_(path) { const j = fsCall_("get", fsBase_() + "/" + path); return j ? fromDoc_(j) : null; }
+function fsGetMany_(paths) {
+  const out = {}; if (!paths.length) return out;
+  const j = fsCall_("post", fsBase_() + ":batchGet", { documents: paths.map(fsName_) }) || [];
+  (Array.isArray(j) ? j : []).forEach(function (x) {
+    if (x.found) { const p = x.found.name.split("/documents/")[1]; out[p] = fromDoc_(x.found); }
+  });
+  return out;
+}
+function fsCommit_(writes) {
+  for (let i = 0; i < writes.length; i += 400) {
+    const chunk = writes.slice(i, i + 400).map(function (w) {
+      const x = { update: { name: fsName_(w.path), fields: toFields_(w.data) } };
+      if (w.mustBeNew) x.currentDocument = { exists: false };
+      if (w.fields) { x.updateMask = { fieldPaths: w.fields }; x.currentDocument = { exists: true }; }
+      return x;
+    });
+    fsCall_("post", fsBase_() + ":commit", { writes: chunk });
+  }
+}
+
+function toValue_(v) {
+  if (v === null || v === undefined) return { nullValue: null };
+  if (typeof v === "boolean") return { booleanValue: v };
+  if (typeof v === "number") return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+  if (typeof v === "string") return { stringValue: v };
+  if (Array.isArray(v)) return { arrayValue: { values: v.map(toValue_) } };
+  if (typeof v === "object") return { mapValue: { fields: toFields_(v) } };
+  return { stringValue: String(v) };
+}
+function toFields_(o) {
+  const f = {};
+  Object.keys(o || {}).forEach(function (k) { if (o[k] !== undefined && k !== "id") f[k] = toValue_(o[k]); });
+  return f;
+}
+function fromValue_(v) {
+  if (!v) return null;
+  if ("stringValue" in v) return v.stringValue;
+  if ("integerValue" in v) return Number(v.integerValue);
+  if ("doubleValue" in v) return v.doubleValue;
+  if ("booleanValue" in v) return v.booleanValue;
+  if ("nullValue" in v) return null;
+  if ("timestampValue" in v) return v.timestampValue;
+  if ("arrayValue" in v) return (v.arrayValue.values || []).map(fromValue_);
+  if ("mapValue" in v) return fromFields_(v.mapValue.fields || {});
+  return null;
+}
+function fromFields_(f) { const o = {}; Object.keys(f || {}).forEach(function (k) { o[k] = fromValue_(f[k]); }); return o; }
+function fromDoc_(d) { const o = fromFields_(d.fields || {}); o.id = d.name.split("/").pop(); return o; }
+
+function iso_() { return new Date().toISOString(); }
+function listDealers_() {
+  return fsList_("dealers", ["name", "website", "inv", "lat", "lon", "addr", "city", "state", "zip", "skip", "brands", "phones", "osm"])
+    .filter(function (d) { return d.skip !== true; })
+    .sort(function (a, b) { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; });
+}
