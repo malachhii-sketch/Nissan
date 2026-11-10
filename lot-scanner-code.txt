@@ -2,6 +2,8 @@
  * Nissan Recall Finder: Lot Scanner
  * Runs in Google Apps Script on a timer. Every few hours it visits each dealership's website,
  * finds the Nissans in its inventory, and saves them to the Recall CRM (Firebase).
+ * Each Nissan's VIN is then checked with Nissan's own recall lookup (the one on nissanusa.com), so the CRM
+ * gets the exact recalls still open on that car, not just the recalls listed for its model and year.
  *
  * Setup: paste the scanner account's password below, save, pick "setup" in the toolbar and click Run.
  */
@@ -17,9 +19,12 @@ const CONFIG = {
   everyHours: 4,       // start a fresh pass over every dealer this often
   runSeconds: 200,     // stop starting new dealers after this long in one run (Apps Script allows 6 minutes)
   batch: 8,            // dealers checked side by side
+
+  recallsPerRun: 60,   // VINs checked with Nissan's recall lookup in one run (0 turns the recall check off)
+  recallEveryDays: 7,  // check each car on a lot again this often, to catch new recalls and finished repairs
 };
 
-const VERSION = "1.0";
+const VERSION = "1.1";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 NissanRecallLotScanner";
 
 /* =========================== Buttons you can run =========================== */
@@ -56,6 +61,15 @@ function testOneSite() {
   const job = new DealerJob({ id: "test", name: "Test", website: site }, null);
   const res = runJobs_([job])[0];
   Logger.log(JSON.stringify(res, null, 1).slice(0, 8000));
+}
+
+/** Looks up one VIN's open recalls and prints them, without saving. Put a VIN between the quotes. */
+function testOneVin() {
+  const vin = "PUT_A_VIN_HERE";
+  const a = lookupRecalls_([vin.toUpperCase()], recallUrl_(true))[0];
+  if (!a.ok) { Logger.log("Couldn't check " + vin + " (HTTP " + a.code + ")."); return; }
+  Logger.log(vin + ": " + a.recalls.length + " open recall(s).");
+  a.recalls.forEach(function (r) { Logger.log(JSON.stringify(r, null, 1)); });
 }
 
 /* =========================== Main run =========================== */
@@ -129,6 +143,10 @@ function scanInner_() {
       props.setProperty("state", JSON.stringify(state));
     }
   }
+
+  // Exact open recalls for the cars on the lots, from Nissan's lookup by VIN.
+  try { checkRecalls_(status, t0 + (CONFIG.runSeconds + 60) * 1000); }
+  catch (e) { Logger.log("Recall check: " + e); status.recalls = Object.assign(status.recalls || {}, { at: iso_(), err: String(e).slice(0, 160) }); }
 
   // Use leftover time to place dealers on the map and find missing websites.
   if ((Date.now() - t0) / 1000 < CONFIG.runSeconds + 40) geocodeSome_(dealers, 25);
@@ -732,6 +750,159 @@ function geocodeSome_(dealers, max) {
     geo[d.id] = hit ? { ll: hit, t: iso_() } : { miss: true, t: iso_() };
   });
   fsCommit_([{ path: "scanner/geo", data: geo }]);
+}
+
+/* =========================== Exact recalls by VIN =========================== */
+
+// Nissan's public recall lookup. The page's form posts the VIN to an address written in the page itself,
+// so the scanner reads that address from the page (it can change when Nissan edits the page).
+const RECALL_SITE = "https://www.nissanusa.com";
+const RECALL_PAGE = RECALL_SITE + "/owners/recalls-vin.html";
+const RECALL_URL = RECALL_SITE + "/content/nissan_prod/en_US/index/owners/recalls-vin/jcr:content/freeEditorial/pagesection_50b2/page-section-par/columns12_ee1c/col1-par/vinrecalllookup_31c7.recallinfo.json";
+
+function recallUrlFromPage(html) {
+  const m = String(html || "").match(/data-json-url="([^"]+\.recallinfo\.json)"/);
+  if (!m) return "";
+  const p = m[1].replace(/&amp;/g, "&");
+  if (p.charAt(0) === "/" && p.charAt(1) !== "/") return RECALL_SITE + p;
+  return p.indexOf(RECALL_SITE + "/") === 0 ? p : "";
+}
+
+/**
+ * Reads the lookup's answer for one VIN.
+ * 200 with a "recalls" list: those are the recalls still open on the car.
+ * 404 "Recalls Not Found": Nissan has no open recall for the car.
+ * Anything else: the car couldn't be checked and is tried again later.
+ */
+function parseRecallAnswer(code, text, vin) {
+  let j = null;
+  try { j = JSON.parse(text); } catch (e) { j = null; }
+  if (code === 200 && j && Array.isArray(j.recalls)) {
+    const str = function (x, n) { return String(x == null ? "" : x).replace(/\s+/g, " ").trim().slice(0, n); };
+    const seen = {}, recalls = [];
+    j.recalls.forEach(function (r) {
+      if (!r || (r.vin && String(r.vin).toUpperCase() !== vin)) return;
+      const x = {
+        n: str(r.govtRecallId, 20), c: str(r.nissanRecallId, 20), t: str(r.secondaryDescription, 160), d: str(r.effectiveDate, 30), ty: str(r.typeCode, 40),
+        s: str(r.primaryDescription, 700), k: str(r.riskIfNotRepaired, 500), m: str(r.remedyDescription, 500),
+      };
+      const id = recallKey(x);
+      if (!id || seen[id]) return;
+      seen[id] = 1; recalls.push(x);
+    });
+    return { ok: true, code: code, recalls: recalls };
+  }
+  if (code === 404 && j && /not found|no data/i.test(String(j.status_code || "") + " " + String(j.status_message || ""))) return { ok: true, code: code, recalls: [] };
+  return { ok: false, code: code, blocked: code === 403 || code === 429, recalls: [] };
+}
+function recallKey(r) { return String(r.c || r.n || r.t || "").replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60); }
+
+/** Which VINs to check now: cars never checked first, then the ones checked longest ago. */
+function pickRecallChecks(lots, nowMs, everyDays, max) {
+  const byVin = {};
+  let cars = 0, checked = 0, open = 0;
+  (lots || []).forEach(function (l) {
+    (l.cars || []).forEach(function (c) {
+      if (!c || !c.v) return;
+      cars++;
+      if (c.rt) { checked++; if ((c.rc || []).length) open++; }
+      const t = c.rt ? Date.parse(c.rt) || 0 : 0;
+      if (byVin[c.v] === undefined || t < byVin[c.v]) byVin[c.v] = t;
+    });
+  });
+  const cutoff = nowMs - everyDays * 864e5;
+  const due = Object.keys(byVin).filter(function (v) { return byVin[v] < cutoff; })
+    .sort(function (a, b) { return byVin[a] - byVin[b] || (a < b ? -1 : 1); });
+  return { vins: due.slice(0, max), cars: cars, checked: checked, open: open, waiting: cars - checked };
+}
+
+/** Puts the answers on the cars. Returns the lots that changed and the recall write-ups to keep. */
+function applyRecalls(lots, answers, now) {
+  const changed = [], texts = {};
+  (lots || []).forEach(function (l) {
+    let hit = false;
+    (l.cars || []).forEach(function (c) {
+      const a = c && answers[c.v];
+      if (!a || !a.ok) return;
+      c.rc = a.recalls.map(function (r) { return { n: r.n, c: r.c, t: r.t, d: r.d, ty: r.ty }; });
+      c.rt = now; hit = true;
+    });
+    if (hit) { l.recallsAt = now; changed.push(l); }
+  });
+  Object.keys(answers).forEach(function (v) { (answers[v].recalls || []).forEach(function (r) { texts[recallKey(r)] = r; }); });
+  return { lots: changed, texts: texts };
+}
+
+function recallUrl_(fresh) {
+  const props = PropertiesService.getScriptProperties();
+  let saved = null;
+  try { saved = JSON.parse(props.getProperty("recallUrl") || "null"); } catch (e) { saved = null; }
+  if (!fresh && saved && saved.u && Date.now() - Date.parse(saved.t) < 7 * 864e5) return saved.u;
+  let u = "";
+  try {
+    const r = UrlFetchApp.fetch(RECALL_PAGE, { muteHttpExceptions: true });
+    if (r.getResponseCode() === 200) u = recallUrlFromPage(r.getContentText());
+  } catch (e) { Logger.log("Recall page: " + e); }
+  if (!u) return (saved && saved.u) || RECALL_URL;
+  props.setProperty("recallUrl", JSON.stringify({ u: u, t: iso_() }));
+  return u;
+}
+
+/** Asks Nissan's lookup about each VIN, one request per VIN. */
+function lookupRecalls_(vins, url) {
+  const reqs = vins.map(function (v) {
+    return { url: url, method: "post", payload: { vinNums: JSON.stringify([v]) }, muteHttpExceptions: true, headers: { "Accept": "application/json", "Cache-Control": "no-store" } };
+  });
+  let resps;
+  try { resps = UrlFetchApp.fetchAll(reqs); } catch (e) { return vins.map(function () { return { ok: false, code: 0, recalls: [] }; }); }
+  return resps.map(function (r, i) {
+    let text = ""; try { text = r.getContentText(); } catch (e) { text = ""; }
+    return parseRecallAnswer(r.getResponseCode(), text, vins[i]);
+  });
+}
+
+/** Checks the cars that are due, a few at a time, and saves each car's open recalls on its lot. */
+function checkRecalls_(status, deadline) {
+  if (!CONFIG.recallsPerRun) return;
+  const was = status.recalls || {};
+  if (was.pausedUntil && Date.parse(was.pausedUntil) > Date.now()) return;
+  const lots = fsList_("lots");
+  const pick = pickRecallChecks(lots, Date.now(), CONFIG.recallEveryDays, CONFIG.recallsPerRun);
+  const out = { at: iso_(), cars: pick.cars, checked: pick.checked, open: pick.open, waiting: pick.waiting, ran: 0, failed: 0 };
+  status.recalls = out;
+  if (!pick.vins.length) return;
+
+  const answers = {};
+  let url = recallUrl_(false), relooked = false;
+  for (let i = 0; i < pick.vins.length && Date.now() < deadline; i += 4) {
+    const group = pick.vins.slice(i, i + 4);
+    let ans = lookupRecalls_(group, url);
+    const blocked = function () { return ans.some(function (a) { return a.blocked; }); };
+    // If nothing in the group could be read, Nissan may have moved the lookup: read its address from the page again, once.
+    if (!relooked && !blocked() && ans.every(function (a) { return !a.ok; })) {
+      relooked = true;
+      const u2 = recallUrl_(true);
+      if (u2 !== url) { url = u2; ans = lookupRecalls_(group, url); }
+    }
+    group.forEach(function (v, k) { if (ans[k].ok) { answers[v] = ans[k]; out.ran++; } else out.failed++; });
+    // Nissan's site is turning the scanner away: stop and leave it alone for a while.
+    if (blocked()) { out.pausedUntil = new Date(Date.now() + 6 * 36e5).toISOString(); out.err = "Nissan's lookup refused the scanner; trying again later."; break; }
+    if (out.failed >= 8 && !out.ran) { out.err = "Nissan's lookup didn't answer (HTTP " + ans[0].code + ")."; break; }
+    Utilities.sleep(400);
+  }
+
+  const res = applyRecalls(lots, answers, iso_());
+  if (!res.lots.length) return;
+  const writes = res.lots.map(function (l) { return { path: "lots/" + l.id, data: l }; });
+  const keys = Object.keys(res.texts);
+  if (keys.length) {
+    const book = fsGet_("scanner/recalls") || {}; delete book.id;
+    keys.forEach(function (k) { book[k] = res.texts[k]; });
+    writes.push({ path: "scanner/recalls", data: book });
+  }
+  fsCommit_(writes);
+  const after = pickRecallChecks(lots, Date.now(), CONFIG.recallEveryDays, 0);
+  out.checked = after.checked; out.open = after.open; out.waiting = after.waiting;
 }
 
 /* =========================== Web requests =========================== */

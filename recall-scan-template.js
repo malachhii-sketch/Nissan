@@ -1,21 +1,22 @@
 /**
  * Recall scan template
  * --------------------
- * Checks dealer websites for vehicles of one make (Nissan by default), decodes each VIN,
- * and lists the NHTSA recalls for that model and year.
+ * Checks dealer websites for Nissans, decodes each VIN, and lists the exact recalls
+ * still open on each car, from Nissan's own recall lookup (the one on nissanusa.com).
  *
  * Steps for each dealer:
  *   1. Find pages that list inventory (robots.txt -> sitemaps -> common inventory pages)
  *   2. Pull every valid VIN out of those pages (17 characters, correct check digit)
  *   3. Keep the VINs for the make you care about (by the first 3 characters, the WMI)
  *   4. Decode year / model / trim with NHTSA's free VIN decoder (vPIC)
- *   5. Look up recalls for that make / model / year with NHTSA's free recalls API
+ *   5. Ask Nissan's recall lookup about each VIN: it answers with the recalls not yet repaired on that car
  *   6. Print a summary and save a CSV
  *
  * Run it:  node recall-scan-template.js        (Node 18 or newer; no packages needed)
  *
- * "Possible recalls" are recalls listed for the model and year. Whether a specific car
- * still has a recall open comes from the automaker (NNA for Nissan), so confirm by VIN.
+ * "Open recalls" are per car: the recalls Nissan shows as not yet repaired for that VIN.
+ * A car Nissan's lookup couldn't answer for is marked "couldn't check", never "0 recalls".
+ * The lookup only knows Nissan and INFINITI vehicles; another make needs its own maker's lookup.
  */
 
 const fs = require("fs");
@@ -30,8 +31,7 @@ const CONFIG = {
   ],
 
   // Which make to keep, by VIN prefix (World Manufacturer Identifier).
-  // Nissan: 1N4 1N6 3N1 3N6 3N8 5N1 JN1 JN6 JN8. For another make, swap these
-  // (e.g. Toyota: 4T1 4T3 5TD 5TF 2T1 2T3 JTD JTE JTM JTN).
+  // Nissan: 1N4 1N6 3N1 3N6 3N8 5N1 JN1 JN6 JN8.
   wmi: ["1N4", "1N6", "3N1", "3N6", "3N8", "5N1", "JN1", "JN6", "JN8"],
   make: "NISSAN", // must match NHTSA's make name
 
@@ -40,6 +40,7 @@ const CONFIG = {
 
   maxSitemaps: 6,          // child sitemaps to open per dealer
   delayMs: 800,            // pause between dealers, to be polite
+  recallDelayMs: 400,      // pause between recall lookups, to be polite
   outputCsv: "recall-scan-results.csv",
   userAgent: "Mozilla/5.0 (compatible; RecallScanTemplate/1.0)",
 };
@@ -171,36 +172,82 @@ async function decodeVins(vins) {
   return out;
 }
 
-/* ============================== 5. Recalls by model and year ============================== */
+/* ============================== 5. Exact recalls by VIN ============================== */
 
-const recallCache = new Map();
+// Nissan's public recall lookup. Its form posts the VIN to an address written in the page itself,
+// so that address is read from the page (it can change when Nissan edits the page).
+const RECALL_SITE = "https://www.nissanusa.com";
+const RECALL_PAGE = RECALL_SITE + "/owners/recalls-vin.html";
+let recallUrl = RECALL_SITE + "/content/nissan_prod/en_US/index/owners/recalls-vin/jcr:content/freeEditorial/pagesection_50b2/page-section-par/columns12_ee1c/col1-par/vinrecalllookup_31c7.recallinfo.json";
+let recallUrlRead = false;
 
-/** NHTSA recalls for a make / model / year (free, no key). Cached so each model-year is asked once. */
-async function recallsFor(make, model, year) {
-  const key = `${make}|${model}|${year}`.toUpperCase();
-  if (recallCache.has(key)) return recallCache.get(key);
-  const url = `https://api.nhtsa.gov/recalls/recallsByVehicle?make=${encodeURIComponent(make)}&model=${encodeURIComponent(model)}&modelYear=${year}`;
-  let list = [];
+function recallUrlFromPage(html) {
+  const m = String(html || "").match(/data-json-url="([^"]+\.recallinfo\.json)"/);
+  if (!m) return "";
+  const p = m[1].replace(/&amp;/g, "&");
+  if (p[0] === "/" && p[1] !== "/") return RECALL_SITE + p;
+  return p.startsWith(RECALL_SITE + "/") ? p : "";
+}
+
+async function readRecallUrl() {
+  recallUrlRead = true;
   try {
-    const res = await fetch(url);
-    if (res.ok) {
-      list = ((await res.json()).results || []).map((r) => ({
-        campaign: r.NHTSACampaignNumber,
-        component: r.Component,
-        summary: r.Summary,
-        remedy: r.Remedy,
-        date: r.ReportReceivedDate,
-      }));
+    const res = await fetch(RECALL_PAGE);
+    if (res.ok) recallUrl = recallUrlFromPage(await res.text()) || recallUrl;
+  } catch (e) { /* keep the address we have */ }
+}
+
+/**
+ * Reads the lookup's answer for one VIN.
+ * 200 with a "recalls" list: the recalls still open on the car.
+ * 404 "Recalls Not Found": no open recall. Anything else: couldn't check.
+ */
+function parseRecallAnswer(status, text, vin) {
+  let j = null;
+  try { j = JSON.parse(text); } catch (e) { j = null; }
+  if (status === 200 && j && Array.isArray(j.recalls)) {
+    const str = (x) => String(x == null ? "" : x).replace(/\s+/g, " ").trim();
+    const seen = new Set(), recalls = [];
+    for (const r of j.recalls) {
+      if (!r || (r.vin && String(r.vin).toUpperCase() !== vin)) continue;
+      const x = {
+        nhtsaId: str(r.govtRecallId), nissanId: str(r.nissanRecallId), name: str(r.secondaryDescription), type: str(r.typeCode),
+        date: str(r.effectiveDate), summary: str(r.primaryDescription), risk: str(r.riskIfNotRepaired), remedy: str(r.remedyDescription),
+      };
+      const id = x.nissanId || x.nhtsaId || x.name;
+      if (!id || seen.has(id)) continue;
+      seen.add(id); recalls.push(x);
     }
-  } catch (e) { /* leave empty */ }
-  recallCache.set(key, list);
-  return list;
+    return { checked: true, recalls };
+  }
+  if (status === 404 && j && /not found|no data/i.test(`${j.status_code || ""} ${j.status_message || ""}`)) return { checked: true, recalls: [] };
+  return { checked: false, status, recalls: [] };
+}
+
+async function askRecalls(vin) {
+  try {
+    const res = await fetch(recallUrl, {
+      method: "POST",
+      headers: { Accept: "application/json", "Cache-Control": "no-store" },
+      body: new URLSearchParams({ vinNums: JSON.stringify([vin]) }),
+    });
+    return parseRecallAnswer(res.status, await res.text(), vin);
+  } catch (e) {
+    return { checked: false, status: 0, recalls: [] };
+  }
+}
+
+/** The recalls still open on one car, straight from Nissan's lookup. */
+async function openRecallsForVin(vin) {
+  if (!recallUrlRead) await readRecallUrl();
+  return askRecalls(vin);
 }
 
 /* ============================== 6. Putting it together ============================== */
 
 async function main() {
   const rows = [];
+  let stopped = "";
   for (const dealer of CONFIG.dealers) {
     const scan = await scanDealer(dealer);
     const decoded = await decodeVins(scan.vins.map((v) => v.vin));
@@ -208,18 +255,29 @@ async function main() {
     for (const v of scan.vins) {
       const info = decoded[v.vin] || {};
       if (info.make && info.make !== CONFIG.make) continue; // decoder says it's another make
-      const recalls = info.model && info.year ? await recallsFor(CONFIG.make, info.model, info.year) : [];
-      console.log(`  ${info.year || "?"} ${info.model || "?"} ${info.trim || ""}  ${v.vin}  ${recalls.length} possible recall(s)` +
-        (recalls.length ? `: ${recalls.map((r) => r.campaign).join(", ")}` : ""));
-      rows.push([dealer.name, dealer.website, v.vin, info.year || "", info.model || "", info.trim || "", recalls.length, recalls.map((r) => r.campaign).join(" "), v.url]);
+      let answer = { checked: false, recalls: [] };
+      if (!stopped) {
+        answer = await openRecallsForVin(v.vin);
+        // Nissan's site is turning us away: stop asking, and mark the rest "couldn't check".
+        if (answer.status === 403 || answer.status === 429) stopped = `Nissan's lookup refused the request (HTTP ${answer.status})`;
+        await sleep(CONFIG.recallDelayMs);
+      }
+      const r = answer.recalls;
+      const ids = r.map((x) => x.nhtsaId || x.nissanId);
+      console.log(`  ${info.year || "?"} ${info.model || "?"} ${info.trim || ""}  ${v.vin}  ` +
+        (answer.checked ? `${r.length} open recall(s)` + (r.length ? `: ${r.map((x) => `${x.nhtsaId || x.nissanId} ${x.name}`).join("; ")}` : "") : "couldn't check"));
+      rows.push([dealer.name, dealer.website, v.vin, info.year || "", info.model || "", info.trim || "",
+        answer.checked ? r.length : "couldn't check", ids.join(" "), r.map((x) => x.nissanId).join(" "), r.map((x) => x.name).join("; "),
+        r.map((x) => x.remedy).join(" | "), v.url]);
     }
     await sleep(CONFIG.delayMs);
   }
-  const csv = [["Dealer", "Website", "VIN", "Year", "Model", "Trim", "Possible recalls", "Campaigns", "Listing"], ...rows]
+  if (stopped) console.log(`\n${stopped}. Cars after that point are marked "couldn't check"; run it again later.`);
+  const csv = [["Dealer", "Website", "VIN", "Year", "Model", "Trim", "Open recalls", "NHTSA IDs", "Nissan IDs", "Recall names", "Remedies", "Listing"], ...rows]
     .map((r) => r.map((x) => `"${String(x).replace(/"/g, '""')}"`).join(",")).join("\n");
   fs.writeFileSync(CONFIG.outputCsv, csv);
   console.log(`\nSaved ${rows.length} vehicle(s) to ${CONFIG.outputCsv}`);
 }
 
 if (require.main === module) main();
-module.exports = { CONFIG, main, isValidVin, findVins, readRobots, scanDealer, decodeVins, recallsFor };
+module.exports = { CONFIG, main, isValidVin, findVins, readRobots, scanDealer, decodeVins, openRecallsForVin, parseRecallAnswer, recallUrlFromPage };
