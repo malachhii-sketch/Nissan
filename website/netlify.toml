@@ -1,5 +1,0 @@
-# Netlify settings for the CRM website.
-# If Netlify builds this site from the GitHub repo, set the site's "Base directory" to "website".
-[build]
-  publish = "."
-  functions = "netlify/functions"

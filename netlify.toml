@@ -1,0 +1,5 @@
+# Netlify settings for the CRM website (the site lives in the website/ folder).
+# In Netlify, leave "Base directory" empty: these paths are from the top of the repo.
+[build]
+  publish = "website"
+  functions = "website/netlify/functions"
