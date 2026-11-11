@@ -687,7 +687,7 @@ input[type="file"] { max-width: 100%; font-size: .9375rem; }
       <div id="vin-sum"></div>
       <details class="gone"><summary>VINs to check (<span id="vin-todo-n">0</span>)</summary><div id="vin-todo"></div></details>
       <div class="row"><button type="button" class="btn quiet sm" id="vin-xlsx">Download spreadsheet of cars to check</button><label class="btn quiet sm" for="vin-xlsx-in">Upload checked spreadsheet</label><input type="file" id="vin-xlsx-in" accept=".xlsx" hidden></div>
-      <p class="legend">The spreadsheet has a row for each car and recall its model and year may have. Check the car in DBS, pick Yes or No under "Still open?", add any other open campaign numbers, then upload it here.</p>
+      <p class="legend">The spreadsheet has one row per car. Check the car in DBS, pick its open campaigns (or None) from the dropdowns, type any others under "Other open campaigns", then upload it here.</p>
       <div class="row"><button type="button" class="btn" id="vin-auto">Check lot VINs with Nissan</button><button type="button" class="btn ghost sm" id="vin-auto-stop" hidden>Stop</button></div>
       <div id="vin-auto-out"><p class="legend">Asks Nissan's recall lookup about lot cars not checked in the last 7 days and saves each car's open campaign numbers. Nissan only answers a few at a time from the website; the lot scanner checks the rest every hour. Keep this page open while it runs.</p></div>
       <div class="field"><label class="label" for="vin-in">Results to save</label>
@@ -3167,11 +3167,11 @@ function zipStore(files) {
 }
 const xesc = v => String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
 const colName = i => { let s = ""; i++; while (i) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; };
-/** One-sheet .xlsx: bold, frozen header row; a Yes/No dropdown in one column. */
-function buildXlsx(header, rows, dropdownCol, widths) {
+/** One-sheet .xlsx: bold, frozen header row; dropdown lists on the given cells ([{ ref: "H2:M2", list: ["R21A6", "None"] }]). */
+function buildXlsx(header, rows, dropdowns, widths) {
   const cell = (v, r, c, st) => (typeof v === "number" ? `<c r="${colName(c)}${r}"${st ? ' s="1"' : ""}><v>${v}</v></c>` : `<c r="${colName(c)}${r}" t="inlineStr"${st ? ' s="1"' : ""}><is><t xml:space="preserve">${xesc(v)}</t></is></c>`);
   const data = [header].concat(rows).map((row, i) => `<row r="${i + 1}">${row.map((v, c) => v === "" || v == null ? "" : cell(v, i + 1, c, i === 0)).join("")}</row>`).join("");
-  const dv = rows.length ? `<dataValidations count="1"><dataValidation type="list" allowBlank="1" showErrorMessage="1" errorTitle="Pick Yes or No" error="Choose Yes (still open) or No (not open)." sqref="${colName(dropdownCol)}2:${colName(dropdownCol)}${rows.length + 1}"><formula1>"Yes,No"</formula1></dataValidation></dataValidations>` : "";
+  const dv = dropdowns.length ? `<dataValidations count="${dropdowns.length}">${dropdowns.map(d => `<dataValidation type="list" allowBlank="1" showErrorMessage="1" errorTitle="Pick from the list" error="Choose one of this car's campaign numbers, or None. Type others under Other open campaigns." sqref="${d.ref}"><formula1>"${xesc(d.list.join(","))}"</formula1></dataValidation>`).join("")}</dataValidations>` : "";
   const ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"';
   return zipStore([
     ["[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'],
@@ -3182,60 +3182,94 @@ function buildXlsx(header, rows, dropdownCol, widths) {
     ["xl/worksheets/sheet1.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet ${ns}><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${widths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("")}</cols><sheetData>${data}</sheetData>${dv}</worksheet>`],
   ]);
 }
-const CHECK_HEAD = ["VIN", "Year", "Model", "Dealer", "City", "Dealer phone", "Recall #", "What it's for", "Recall date", "Still open?", "Other open campaigns", "Listing"];
-const CHECK_COL = { vin: 0, recall: 6, what: 7, open: 9, other: 10 };
-/** The lot cars to check (never checked, or checked 30+ days ago) with each recall their model and year may have: one row per car and recall. */
-function checkSheetRows() {
-  const old = Date.now() - 30 * 864e5, seen = new Set(), rows = [];
+/* Nissan's campaign number for each recall in RECALL_DATA, from NHTSA's records ("Nissan's number for this recall is ...").
+   Recalls whose records don't give one aren't listed. */
+const NISSAN_CODES = {"20V556000":["PC751"],"20V570000":["PC752"],"20V685000":["PC765"],"21V068000":["PC791"],"21V135000":["PM971"],"21V138000":["PC795"],"21V169000":["PC798"],"21V170000":["PC797"],"21V186000":["PC799"],"21V286000":["PC804"],"21V373000":["R21A2"],"21V461000":["PM985"],"21V471000":["PM986","PC811"],"21V474000":["PC812"],"21V525000":["R21A7"],"21V555000":["RT049"],"21V706000":["PC840"],"21V742000":["PC844"],"21V743000":["PC845","PC846","PC847"],"21V774000":["R21B4","R21B5"],"21V839000":["R21B6"],"21V917000":["PC855"],"21V957000":["R21B8"],"21V958000":["PC856"],"22V024000":["R21B9"],"22V111000":["PC867","PC868"],"22V244000":["R20B4"],"22V259000":["PC887"],"22V420000":["R22A2","R22A3","R24B7"],"22V457000":["R22A2","R22A3"],"22V527000":["R22A5","PC901","PC902"],"22V660000":["PC912"],"22V666000":["PC915"],"22V693000":["PMA10"],"22V772000":["R22B8","R22C1","PC923"],"22V875000":["PC934"],"23V048000":["R22C5"],"23V093000":["R22C5"],"23V131000":["PC956"],"23V268000":["PC966","PC967"],"23V273000":["PC973","PC974"],"23V296000":["R23A1"],"23V362000":["PC976"],"23V374000":["PC978","PC979"],"23V494000":["R23A6"],"23V496000":["PMA26"],"23V581000":["R23B3"],"23V628000":["R23C3"],"23V657000":["R23C6"],"23V725000":["R23C8"],"23V791000":["PC933"],"23V882000":["PC997"],"24V053000":["PD102"],"24V071000":["R23D7"],"24V154000":["PD103","PD104","PMA34"],"24V156000":["PD105"],"24V176000":["PD106","PD107"],"24V304000":["PMA37"],"24V391000":["R24A3"],"24V479000":["PD109"],"24V498000":["PMA38"],"24V560000":["R24A8"],"24V580000":["PD120"],"24V582000":["PD121"],"24V700000":["R24B2","P4A38","P5A22"],"24V748000":["R24B3","R24B4"],"24V798000":["R24B6"],"24V969000":["PMA42"],"25V153000":["PMA45"],"25V173000":["PD137","PD138"],"25V188000":["PD136","PMA47"],"25V324000":["PD152","PMA48"],"25V437000":["R25A8"],"25V508000":["R25C3"],"25V655000":["R25C8"],"25V676000":["PMA56"],"25V807000":["PMA58"],"25V821000":["R25D6","R25D5","R25D7"],"25V912000":["PD180"],"26V023000":["PD185","PMA61"],"26V080000":["R25E2","R25E3"],"26V081000":["R25E2","R25E3","R25A9"],"26V145000":["PMA64"],"26V188000":["R25F1"],"26V331000":["PMA66"],"26V410000":["PMA68"],"26V419000":["PD198"],"26V425000":["R26A7"],"26V455000":["R26B1","P6A13"],"26V526000":["PD202"]};
+const CAMP_COLS = 6, FIRST_CAMP = 7;
+const CHECK_HEAD = ["VIN", "Year", "Model", "Dealer", "City", "Dealer phone", "Possible campaigns"]
+  .concat(Array.from({ length: CAMP_COLS }, (_, i) => `Open campaign ${i + 1}`), ["Other open campaigns", "Listing"]);
+/** Nissan campaign numbers already found open on lot cars, by model and year (from DBS checks and pasted lists). */
+function seenCampaignsByModelYear() {
+  const m = new Map();
+  S.lots.forEach(lot => ((lot && lot.cars) || []).forEach(c => {
+    const ck = c && vcheck(c.v), k = c && carKey(c.md);
+    if (!ck || !k || !c.y) return;
+    const g = m.get(k + "|" + c.y) || new Map();
+    (ck.open || []).forEach(o => { if (o.c && !/^\d{2}V\d{6}$/.test(o.c) && !g.has(o.c)) g.set(o.c, o.d || ""); });
+    m.set(k + "|" + c.y, g);
+  }));
+  return m;
+}
+/** The Nissan campaign numbers a car may have: its model and year's recalls, plus numbers found open on other cars of that model and year. */
+function campaignOptions(c, byMY) {
+  const opts = new Map();
+  carRecalls(c).forEach(rid => (NISSAN_CODES[rid] || []).forEach(code => { if (!opts.has(code)) { const r = C[rid] || {}; opts.set(code, r.comp ? compParts(r.comp).title : ""); } }));
+  const k = carKey(c.md), mine = k && c.y ? byMY.get(k + "|" + c.y) : null;
+  if (mine) mine.forEach((d, code) => { if (!opts.has(code)) opts.set(code, d); });
+  return opts;
+}
+/** The lot cars to check (never checked, or checked 30+ days ago): one row per car, with a dropdown of its possible campaigns in each "Open campaign" column. */
+function checkSheet() {
+  const old = Date.now() - 30 * 864e5, seen = new Set(), cars = [], byMY = seenCampaignsByModelYear();
   S.lots.forEach((lot, id) => ((lot && lot.cars) || []).forEach(c => {
     if (!c || !c.v || seen.has(c.v) || isRemoved(c)) return;
-    seen.add(c.v);
+    seen.add(c.v); // a car listed by several dealers gets one row
     const k = vcheck(c.v);
     if (k && Date.parse(k.at) >= old) return;
-    const ids = carRecalls(c); if (!ids.length) return;
-    const d = S.dealers.get(id) || {};
-    ids.forEach(rid => {
-      const r = C[rid] || {}, what = r.comp ? `${compParts(r.comp).title}: ${String(r.defect || "").split(/(?<=\.)\s/)[0]}` : "";
-      rows.push([c.v, Number(c.y) || "", c.md || "", d.name || id, d.city || "", ((d.phones || [])[0] || {}).n || "", rid, what.slice(0, 250), r.date || "", "", "", c.u || ""]);
-    });
+    const opts = campaignOptions(c, byMY);
+    if (!opts.size && !carRecalls(c).length) return;
+    cars.push({ c, id, d: S.dealers.get(id) || {}, opts });
   }));
-  return rows.sort((a, b) => String(a[3]).localeCompare(String(b[3])) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  cars.sort((a, b) => String(a.d.name || a.id).localeCompare(String(b.d.name || b.id)) || (a.c.v < b.c.v ? -1 : 1));
+  const rows = [], vals = [];
+  cars.forEach(({ c, id, d, opts }, i) => {
+    const list = [...opts].slice(0, 20);
+    const unlisted = carRecalls(c).filter(rid => !(NISSAN_CODES[rid] || []).length).map(rid => { const r = C[rid] || {}; return `${r.comp ? compParts(r.comp).title : "Recall"} (Nissan number not listed)`; });
+    const possible = list.map(([code, desc]) => (desc ? `${code} ${desc}` : code)).concat(unlisted).join("; ");
+    rows.push([c.v, Number(c.y) || "", c.md || "", d.name || id, d.city || "", ((d.phones || [])[0] || {}).n || "", possible].concat(Array(CAMP_COLS).fill(""), ["", c.u || ""]));
+    vals.push({ ref: `${colName(FIRST_CAMP)}${i + 2}:${colName(FIRST_CAMP + CAMP_COLS - 1)}${i + 2}`, list: list.map(x => x[0]).concat(["None"]) });
+  });
+  return { rows, vals };
 }
 $("#vin-xlsx").addEventListener("click", () => {
-  const rows = checkSheetRows();
+  const { rows, vals } = checkSheet();
   if (!rows.length) { toast("No lot cars need checking right now."); return; }
-  const blob = buildXlsx(CHECK_HEAD, rows, CHECK_COL.open, [20, 6, 14, 30, 16, 15, 12, 60, 11, 12, 22, 40]);
+  const blob = buildXlsx(CHECK_HEAD, rows, vals, [20, 6, 14, 30, 16, 15, 60].concat(Array(CAMP_COLS).fill(16), [24, 40]));
   const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `cars-to-check-${localISO()}.xlsx`;
   document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
-  toast(`Downloaded ${plural(new Set(rows.map(r => r[0])).size, "car")} to check`);
+  toast(`Downloaded ${plural(rows.length, "car")} to check`);
 });
-/** Reads a filled-in spreadsheet: for each car, the recalls marked "Yes" plus any other campaign numbers are its open campaigns. */
+/** Reads a filled-in spreadsheet: the campaigns picked under "Open campaign", plus any typed under "Other open campaigns", are the car's
+   open campaigns; "None" means none are open; a car with nothing picked isn't checked yet. */
 function parseCheckSheet(rows) {
-  const norm = v => String(v == null ? "" : v).trim().toLowerCase().replace(/[^a-z0-9#]+/g, " ").trim();
-  const hi = rows.findIndex(r => r && r.some(v => norm(v) === "vin") && r.some(v => norm(v) === "still open"));
-  if (hi < 0) return { rows: [], errors: ["This isn't the cars-to-check spreadsheet: it needs \"VIN\" and \"Still open?\" columns. Download it from this panel first."] };
-  const col = {}; rows[hi].forEach((h, i) => { const k = norm(h); if (k === "vin") col.vin = i; if (k === "recall #") col.recall = i; if (k === "what it s for") col.what = i; if (k === "still open") col.open = i; if (k === "other open campaigns") col.other = i; });
+  const norm = v => String(v == null ? "" : v).trim().toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const hi = rows.findIndex(r => r && r.some(v => norm(v) === "vin") && r.some(v => norm(v) === "open campaign 1"));
+  if (hi < 0) return { rows: [], errors: ["This isn't the cars-to-check spreadsheet: it needs \"VIN\" and \"Open campaign\" columns. Download it from this panel first."] };
+  const col = { camps: [] };
+  rows[hi].forEach((h, i) => { const k = norm(h); if (k === "vin") col.vin = i; else if (/^open campaign \d+$/.test(k)) col.camps.push(i); else if (k === "other open campaigns") col.other = i; else if (k === "possible campaigns") col.possible = i; });
+  const isCode = x => /^[A-Z0-9]{3,10}$/.test(x) && /\d/.test(x) && /[A-Z]/.test(x);
   const cars = new Map(), errors = [];
   rows.slice(hi + 1).forEach((r, n) => {
     if (!r) return;
     const vin = String(r[col.vin] == null ? "" : r[col.vin]).replace(/\s/g, "").toUpperCase(); if (!vin) return;
     if (!VIN_RE17.test(vin)) { errors.push(`Row ${hi + n + 2}: "${vin}" isn't a VIN.`); return; }
-    const g = cars.get(vin) || { open: new Map(), yes: 0, no: 0, blank: 0 };
-    const ans = norm(r[col.open]), rid = String(r[col.recall] == null ? "" : r[col.recall]).trim().toUpperCase();
-    if (/^(yes|y|open|true)$/.test(ans)) { g.yes++; if (rid) g.open.set(rid, String(r[col.what] || "").split(":")[0].trim()); }
-    else if (/^(no|n|closed|done|false)$/.test(ans)) g.no++;
-    else if (!ans) g.blank++;
-    else errors.push(`Row ${hi + n + 2} (${vin}): "${r[col.open]}" under Still open? should be Yes or No.`);
-    String(col.other === undefined || r[col.other] == null ? "" : r[col.other]).toUpperCase().split(/[,;\s]+/).filter(x => /^[A-Z0-9]{3,10}$/.test(x) && /\d/.test(x) && /[A-Z]/.test(x)).forEach(x => { if (!g.open.has(x)) g.open.set(x, ""); g.other = true; });
+    const g = cars.get(vin) || { open: new Map(), none: false };
+    const desc = {}; String(col.possible === undefined || r[col.possible] == null ? "" : r[col.possible]).split(";").forEach(x => { const m = x.trim().match(/^([A-Z0-9]{3,10})\s+(.+)$/); if (m) desc[m[1]] = m[2]; });
+    col.camps.forEach(i => {
+      const v = String(r[i] == null ? "" : r[i]).trim().toUpperCase(); if (!v) return;
+      if (v === "NONE") g.none = true;
+      else if (isCode(v)) { if (!g.open.has(v)) g.open.set(v, desc[v] || ""); }
+      else errors.push(`Row ${hi + n + 2} (${vin}): "${r[i]}" isn't a campaign number. Pick one from the list or None.`);
+    });
+    String(col.other === undefined || r[col.other] == null ? "" : r[col.other]).toUpperCase().split(/[,;\s]+/).filter(isCode).forEach(x => { if (!g.open.has(x)) g.open.set(x, desc[x] || ""); });
     cars.set(vin, g);
   });
   const out = [];
   cars.forEach((g, vin) => {
-    if (!g.yes && !g.no && !g.other) return; // not checked yet
-    if (g.blank) errors.push(`${vin}: ${plural(g.blank, "recall")} left blank ${g.blank === 1 ? "was" : "were"} counted as not open.`);
-    out.push({ vin, open: [...g.open].map(([c, d]) => (d ? { c, d } : { c })).filter(o => /^[A-Z0-9]{3,10}$/.test(o.c)), src: "Nissan" });
+    if (!g.open.size && !g.none) return; // not checked yet
+    out.push({ vin, open: [...g.open].map(([c, d]) => (d ? { c, d } : { c })), src: "Nissan" });
   });
-  if (!out.length && !errors.length) errors.push("No answers found. Pick Yes or No under \"Still open?\" for the cars you checked.");
+  if (!out.length && !errors.length) errors.push("No answers found. Pick the open campaigns (or None) for the cars you checked.");
   return { rows: out, errors };
 }
 $("#vin-xlsx-in").addEventListener("change", async e => {

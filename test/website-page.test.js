@@ -190,20 +190,48 @@ test("a pasted list adds missing dealers and their cars, and matches dealers the
 });
 
 /* ---------- Cars-to-check spreadsheet ---------- */
-test("reads a filled-in cars-to-check spreadsheet: Yes rows and other campaign numbers are open, blanks aren't checked", () => {
-  const ctx = { console, JSON, String, Number, Array, Object, RegExp, Math, Map, Set, VIN_RE17: /^[A-HJ-NPR-Z0-9]{17}$/, plural: (n, o) => `${n} ${n === 1 ? o : o + "s"}` };
+function sheetCtx() {
+  const ctx = { console, JSON, String, Number, Array, Object, RegExp, Math, Map, Set, Date, VIN_RE17: /^[A-HJ-NPR-Z0-9]{17}$/,
+    plural: (n, o) => `${n} ${n === 1 ? o : o + "s"}`, S: { lots: new Map(), dealers: new Map(), vchk: new Map() },
+    C: { "21V135000": { comp: "ELECTRICAL SYSTEM:STOP LAMP SWITCH" }, "16V244000": { comp: "AIR BAGS" } },
+    compParts: (c) => ({ title: String(c).split(":").pop().toLowerCase().replace(/^./, (x) => x.toUpperCase()) }),
+    carKey: (md) => String(md || "").toUpperCase() || null, isRemoved: () => false };
+  ctx.carRecalls = (c) => (c.md === "Sentra" ? ["21V135000", "16V244000"] : []);
+  ctx.vcheck = (vin) => { const k = ctx.S.vchk.get(vin); return k && k.at ? k : null; };
   vm.createContext(ctx);
-  vm.runInContext(grab("const CHECK_HEAD", "$(\"#vin-xlsx\")") + grab("function parseCheckSheet", "$(\"#vin-xlsx-in\")") + "\nthis.p = parseCheckSheet; this.H = CHECK_HEAD;", ctx);
-  const H = [...ctx.H], row = (vin, rid, open, other) => [vin, 2014, "Rogue", "Dealer", "City", "", rid, "Wiring: chafes.", "2021-03-01", open, other, ""];
-  const r = JSON.parse(JSON.stringify(ctx.p([H,
-    row("5N1AT2MV4EC836473", "21V123000", "Yes", ""), row("5N1AT2MV4EC836473", "15V456000", "No", "PC459, r21b9"),
-    row("1N4AL3AP1FC286673", "21V551000", "no", ""),
-    row("3N1AB7AP1KY233254", "19V100000", "", ""),
-    row("JN8AT2MV8HW000127", "18V001000", "Yes", ""), row("JN8AT2MV8HW000127", "18V002000", "", ""),
-    row("5N1AR2MM3FC658711", "15V700000", "maybe", "")])));
-  assert.deepEqual(r.rows.map((x) => [x.vin, x.open.map((o) => o.c)]), [
-    ["5N1AT2MV4EC836473", ["21V123000", "PC459", "R21B9"]], ["1N4AL3AP1FC286673", []], ["JN8AT2MV8HW000127", ["18V001000"]]]);
-  assert.match(r.errors.join("\n"), /JN8AT2MV8HW000127: 1 recall left blank was counted as not open/);
-  assert.match(r.errors.join("\n"), /"maybe" under Still open\? should be Yes or No/);
-  assert.match(ctx.p([["Name", "Phone"]]).errors[0], /isn't the cars-to-check spreadsheet/);
+  vm.runInContext(grab("const colName", "/** One-sheet .xlsx") + grab("const NISSAN_CODES", "$(\"#vin-xlsx\")") + grab("function parseCheckSheet", "$(\"#vin-xlsx-in\")") +
+    "\nthis.f = { sheet: checkSheet, parse: parseCheckSheet, head: CHECK_HEAD };", ctx);
+  return ctx;
+}
+
+test("cars-to-check spreadsheet: one row per car, dropdowns of Nissan campaign numbers (not NHTSA numbers)", () => {
+  const ctx = sheetCtx(), S = ctx.S, now = new Date().toISOString();
+  S.dealers.set("d1", { name: "Glassman Hyundai", city: "Southfield", phones: [{ n: "(248) 555-0100" }] });
+  S.dealers.set("d2", { name: "Another Store", city: "Troy" });
+  S.lots.set("d1", { cars: [{ v: "3N1AB7AP1KY233254", y: 2019, md: "Sentra" }, { v: "1N4AL3AP1FC286673", y: 2015, md: "Altima" }, { v: "1N4AL3AP2FC000001", y: 2015, md: "Altima" }] });
+  S.lots.set("d2", { cars: [{ v: "3N1AB7AP1KY233254", y: 2019, md: "Sentra" }] }); // the same car listed by a second dealer
+  S.vchk.set("1N4AL3AP2FC000001", { at: now, open: [{ c: "R21A6", d: "ALTIMA HOOD LATCH" }, { c: "21V551000" }] }); // already checked in DBS
+  const { rows, vals } = JSON.parse(JSON.stringify(ctx.f.sheet()));
+  assert.deepEqual(rows.map((r) => r[0]), ["1N4AL3AP1FC286673", "3N1AB7AP1KY233254"], "no duplicates; the checked car isn't listed");
+  const sentra = rows[1], altima = rows[0];
+  assert.equal(sentra[6], "PM971 Stop lamp switch; Air bags (Nissan number not listed)");
+  assert.deepEqual(vals[1], { ref: "H3:M3", list: ["PM971", "None"] });
+  assert.equal(altima[6], "R21A6 ALTIMA HOOD LATCH", "learned from another 2015 Altima checked in DBS; NHTSA numbers aren't offered");
+  assert.deepEqual(vals[0].list, ["R21A6", "None"]);
+  assert.ok(!JSON.stringify(vals).includes("21V"), "no NHTSA numbers in the dropdowns");
+});
+
+test("reads a filled-in cars-to-check spreadsheet: picked and typed campaigns are open, None is clean, blank isn't checked", () => {
+  const ctx = sheetCtx(), H = [...ctx.f.head];
+  const row = (vin, possible, picks, other) => [vin, 2019, "Sentra", "Dealer", "City", "", possible].concat(picks.concat(Array(6 - picks.length).fill("")), [other, ""]);
+  const r = JSON.parse(JSON.stringify(ctx.f.parse([H,
+    row("5N1AT2MV4EC836473", "PC459 Liftgate stay; PC490 CVT reprogram", ["PC490"], "pd108, R21B9"),
+    row("1N4AL3AP1FC286673", "R21A6 Hood latch", ["None"], ""),
+    row("3N1AB7AP1KY233254", "PM971 Stop lamp switch", [], ""),
+    row("5N1AR2MM3FC658711", "R24C6 Hood latch", ["maybe"], "")])));
+  assert.deepEqual(r.rows, [
+    { vin: "5N1AT2MV4EC836473", open: [{ c: "PC490", d: "CVT reprogram" }, { c: "PD108" }, { c: "R21B9" }], src: "Nissan" },
+    { vin: "1N4AL3AP1FC286673", open: [], src: "Nissan" }]);
+  assert.match(r.errors[0], /"maybe" isn't a campaign number/);
+  assert.match(ctx.f.parse([["Name", "Phone"]]).errors[0], /isn't the cars-to-check spreadsheet/);
 });
