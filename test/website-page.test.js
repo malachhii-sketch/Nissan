@@ -72,3 +72,46 @@ test("stops after two groups in a row with no answers, even after earlier succes
   assert.equal(s.posts.length, 3, "one good group, then two empty ones");
   assert.match(s.els["vin-auto-out"].innerHTML, /Saved 3 VIN checks.*6 cars couldn't be checked.*\(no answer: 6\).*stopped answering/);
 });
+
+/* ---------- DBS vehicle pages pasted as text ---------- */
+const dbsCode = grab("const DBS_LABELS", "let vinParsed = null;");
+function dbsParse(text) {
+  const ctx = { console, JSON, String, Number, Array, Object, RegExp, Math, VIN_RE17: /^[A-HJ-NPR-Z0-9]{17}$/ };
+  vm.createContext(ctx); vm.runInContext(dbsCode + "\nthis.parse = parseVinResults;", ctx);
+  return JSON.parse(JSON.stringify(ctx.parse(text)));
+}
+const TOP = (vin, n) => `2015 NISSAN ALTIMA\nVIN: ${vin}\nModel Line: ALTIMA\nWINDOW STICKER\nOpen Campaigns\n${n}\nStop Sales\n1 Stop Sale Records Found.\nBranded Title\nNo Branded Title Found\nTSBs\n136 Active TSB(s)\n`;
+const LINES = "Open Campaign Information\nCampaign #: R21A6\nActivation Date: June 24, 2021\nCampaign Description\nALTIMA HOOD LATCH NTB21-055\nLearn More.\nRepair Complete\nNO\nStop Sale\nYES\nParts Restriction\nNO\n";
+const COLUMNS = "Open Campaign Information\nCampaign #: R21A6\tActivation Date: June 24, 2021\nCampaign Description\tRepair Complete\tStop Sale\tParts Restriction\nALTIMA HOOD LATCH NTB21-055\tNO\tYES\tNO\nLearn More.\n";
+const R21A6 = { c: "R21A6", d: "ALTIMA HOOD LATCH NTB21-055", a: "2021-06-24", ss: true };
+
+test("reads a pasted DBS page, laid out as lines or as columns", () => {
+  for (const body of [LINES, COLUMNS]) {
+    const r = dbsParse(TOP("1N4AL3AP1FC286673", "1 Active Campaign(s)") + body);
+    assert.deepEqual(r.errors, []);
+    assert.deepEqual(r.rows, [{ vin: "1N4AL3AP1FC286673", open: [R21A6], src: "DBS" }]);
+  }
+});
+
+test("several DBS pages pasted one after another, including a car with none", () => {
+  const second = "Campaign #: PC948\nActivation Date: March 3, 2024\nCampaign Description\nCVT SOFTWARE\nRepair Complete\nNO\nStop Sale\nNO\nParts Restriction\nYES\n";
+  const r = dbsParse(TOP("1N4AL3AP1FC286673", "2 Active Campaign(s)") + LINES + second + "\n" + TOP("3N1AB8CV5MY123456", "No Active Campaign(s)"));
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.rows[0].open.map((o) => o.c), ["R21A6", "PC948"]);
+  assert.deepEqual(r.rows[0].open[1], { c: "PC948", d: "CVT SOFTWARE", a: "2024-03-03", pr: true });
+  assert.deepEqual(r.rows[1], { vin: "3N1AB8CV5MY123456", open: [], src: "DBS" });
+});
+
+test("won't save a car as clean when its campaign details weren't copied", () => {
+  const r = dbsParse(TOP("1N4AL3AP1FC286673", "1 Active Campaign(s)"));
+  assert.equal(r.rows.length, 0);
+  assert.match(r.errors[0], /1N4AL3AP1FC286673: DBS says 1 active campaign, but the details weren't copied/);
+  const u = dbsParse("VIN: 1N4AL3AP1FC286673\nOpen Campaigns\n");
+  assert.equal(u.rows.length, 0); assert.match(u.errors[0], /couldn't find its campaigns/);
+});
+
+test("a campaign DBS shows as repaired isn't counted as open; typed lines still work", () => {
+  const done = LINES.replace("Repair Complete\nNO", "Repair Complete\nYES");
+  assert.deepEqual(dbsParse(TOP("1N4AL3AP1FC286673", "1 Active Campaign(s)") + done).rows[0].open, []);
+  assert.deepEqual(dbsParse("5N1BT3BB2PC836400: R25E2\n3N1AB8CV5MY123456: none").rows.map((x) => x.open.length), [1, 0]);
+});

@@ -689,7 +689,7 @@ input[type="file"] { max-width: 100%; font-size: .9375rem; }
       <div class="row"><button type="button" class="btn" id="vin-auto">Check lot VINs with Nissan</button><button type="button" class="btn ghost sm" id="vin-auto-stop" hidden>Stop</button></div>
       <div id="vin-auto-out"><p class="legend">Asks Nissan's recall lookup about lot cars not checked in the last 7 days and saves each car's open campaign numbers. Nissan only answers a few at a time from the website; the lot scanner checks the rest every hour. Keep this page open while it runs.</p></div>
       <div class="field"><label class="label" for="vin-in">Results to save</label>
-        <textarea id="vin-in" rows="5" spellcheck="false" autocomplete="off" placeholder="One VIN per line with its open campaign numbers, for example:&#10;5N1BT3BB2PC836400: R25E2&#10;3N1AB8CV5MY123456: none"></textarea></div>
+        <textarea id="vin-in" rows="5" spellcheck="false" autocomplete="off" placeholder="Paste DBS vehicle pages here: in DBS, open the car, expand Open Campaign Information, press Ctrl+A then Ctrl+C. You can paste several cars one after another.&#10;Or type one VIN per line with its open campaigns:&#10;5N1BT3BB2PC836400: R25E2&#10;3N1AB8CV5MY123456: none"></textarea></div>
       <div id="vin-preview"></div>
     </div>
     <div class="panel">
@@ -2390,10 +2390,62 @@ function vinIndex() {
   S.customers.forEach((cu, id) => (cu.vehicles || []).forEach(v => { if (!at.has(v.vin)) at.set(v.vin, { kind: "customer", id, c: { v: v.vin, y: v.year, md: v.model } }); }));
   return at;
 }
+/* ---------- DBS vehicle pages pasted as text ----------
+   In DBS: open the car, expand "Open Campaign Information", Ctrl+A, Ctrl+C, paste here. Several cars can be pasted one
+   after another. Each car starts at "VIN: ..."; each open campaign at "Campaign #: ...", followed by its activation date,
+   description, Repair Complete, Stop Sale and Parts Restriction (as lines, or as a row of columns). */
+const DBS_LABELS = ["campaign description", "repair complete", "stop sale", "parts restriction"];
+const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+function looksLikeDbs(t) { return /\bVIN\s*:\s*[A-HJ-NPR-Z0-9]{17}/i.test(t) && /Campaign\s*#\s*:|Active\s+Campaign|Open\s+Campaign/i.test(t); }
+function dbsDate(s) { // "June 24, 2021" or "06/24/2021" -> "2021-06-24"
+  let m = String(s || "").match(/([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})/);
+  if (m && MONTHS[m[1].toLowerCase()]) return `${m[3]}-${String(MONTHS[m[1].toLowerCase()]).padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+  m = String(s || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  return m ? `${m[3]}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}` : "";
+}
+function dbsCampaign(seg) {
+  const code = (seg.match(/Campaign\s*#\s*:?\s*([A-Z0-9]{3,10})/i) || [])[1] || "";
+  const lines = seg.replace(/Campaign\s*#\s*:?\s*[A-Z0-9]{3,10}/i, "\n").replace(/Activation\s+Date\s*:?\s*[A-Za-z]+\.?\s+\d{1,2},?\s+\d{4}|Activation\s+Date\s*:?\s*\d{1,2}\/\d{1,2}\/\d{4}/i, "\n")
+    .split(/[\n\t]+/).map(l => l.trim()).filter(l => l && !/^learn more\.?$/i.test(l));
+  const low = lines.map(l => l.toLowerCase().replace(/:$/, ""));
+  const at = DBS_LABELS.map(l => low.indexOf(l));
+  const val = {};
+  if (at[0] >= 0 && at.every((x, i) => x === at[0] + i)) DBS_LABELS.forEach((l, i) => { val[l] = lines[at[0] + 4 + i] || ""; }); // a row of column headings, then a row of values
+  else DBS_LABELS.forEach((l, i) => { val[l] = at[i] >= 0 ? lines[at[i] + 1] || "" : ""; });
+  DBS_LABELS.forEach(l => { if (DBS_LABELS.includes((val[l] || "").toLowerCase())) val[l] = ""; });
+  const yes = v => /^y(es)?$/i.test(String(v || "").trim());
+  return { c: code.toUpperCase(), d: val["campaign description"], a: dbsDate((seg.match(/Activation\s+Date\s*:?\s*([^\n\t]+)/i) || [])[1]),
+    ss: yes(val["stop sale"]), pr: yes(val["parts restriction"]), done: yes(val["repair complete"]) };
+}
+function parseDbsText(t) {
+  const rows = [], errors = [], starts = [];
+  const re = /\bVIN\s*:\s*([A-HJ-NPR-Z0-9]{17})/gi; let m;
+  while ((m = re.exec(t))) starts.push({ i: m.index, vin: m[1].toUpperCase() });
+  starts.forEach((st, k) => {
+    const block = t.slice(st.i, k + 1 < starts.length ? starts[k + 1].i : t.length);
+    const parts = block.split(/(?=Campaign\s*#\s*:)/i).slice(1);
+    const camps = parts.map(dbsCampaign).filter(c => /^[A-Z0-9]{3,10}$/.test(c.c));
+    const open = camps.filter(c => !c.done).map(c => { const o = { c: c.c }; if (c.d) o.d = c.d; if (c.a) o.a = c.a; if (c.ss) o.ss = true; if (c.pr) o.pr = true; return o; });
+    const said = block.match(/(\d+)\s+Active\s+Campaign/i);
+    const none = /\b(?:0|no)\s+(?:active|open)\s+campaign|no\s+open\s+campaigns?\s+(?:found|records)|no\s+campaigns?\s+found/i.test(block);
+    if (said && Number(said[1]) > camps.length) {
+      errors.push(`${st.vin}: DBS says ${said[1]} active campaign${said[1] === "1" ? "" : "s"}, but the details weren't copied. Open "Open Campaign Information" in DBS, then copy the page again.`);
+      return;
+    }
+    if (!camps.length && !none && !(said && said[1] === "0")) {
+      errors.push(`${st.vin}: couldn't find its campaigns. Copy the whole DBS page (Ctrl+A, then Ctrl+C) and paste it again.`);
+      return;
+    }
+    const i = rows.findIndex(r => r.vin === st.vin), row = { vin: st.vin, open, src: "DBS" };
+    if (i >= 0) rows[i] = row; else rows.push(row);
+  });
+  return { rows, errors };
+}
 /** Reads results to save: a JSON list ([{ vin, open: [{ c, d, a, ss, pr }] }]) or lines like "VIN: R25E2, PC948" / "VIN: none". */
 function parseVinResults(text) {
   const t = String(text || "").trim(), rows = [], errors = [];
   if (!t) return { rows, errors };
+  if (looksLikeDbs(t)) return parseDbsText(t);
   const camp = x => typeof x === "string" ? { c: x.trim().toUpperCase() } : {
     c: String(x.c || x.code || x.campaign || "").trim().toUpperCase(), d: String(x.d || x.desc || x.description || "").trim(),
     a: String(x.a || x.activation || x.date || "").slice(0, 10), ss: !!(x.ss ?? x.stopSale), pr: !!(x.pr ?? x.partsRestriction),
@@ -2438,7 +2490,7 @@ function renderVinPanel() {
   renderAutoBtn();
   const name = id => (S.dealers.get(id) || {}).name || id;
   $("#vin-todo").innerHTML = list.length ? `<div class="row"><button type="button" class="btn quiet sm" data-copy="${esc(list.map(x => x.c.v).join("\n"))}">Copy these VINs</button></div>` +
-    list.slice(0, 400).map(x => { const k = vcheck(x.c.v); return `<div class="cline"><span><span class="mono">${esc(x.c.v)}</span> ${esc(carName(x.c))}<br><span class="legend"><button type="button" class="jname" data-dopen="${x.id}">${esc(name(x.id))}</button>${k ? ` · last checked ${esc(dbsDay(k))}` : ` · ${esc(carRecallText(x.c))}`}</span></span></div>`; }).join("")
+    list.slice(0, 400).map(x => { const k = vcheck(x.c.v); return `<div class="cline"><span><button type="button" class="btn quiet sm" data-copy="${esc(x.c.v)}" title="Copy this VIN to paste into DBS">Copy</button> <span class="mono">${esc(x.c.v)}</span> ${esc(carName(x.c))}<br><span class="legend"><button type="button" class="jname" data-dopen="${x.id}">${esc(name(x.id))}</button>${k ? ` · last checked ${esc(dbsDay(k))}` : ` · ${esc(carRecallText(x.c))}`}</span></span></div>`; }).join("")
     : `<p class="legend">${cars.length ? "Every lot car that needs it has been checked." : "Lot cars appear here once the scanner has found some."}</p>`;
 }
 function renderVinPreview() {
