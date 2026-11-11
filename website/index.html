@@ -687,7 +687,7 @@ input[type="file"] { max-width: 100%; font-size: .9375rem; }
       <div id="vin-sum"></div>
       <details class="gone"><summary>VINs to check (<span id="vin-todo-n">0</span>)</summary><div id="vin-todo"></div></details>
       <div class="row"><button type="button" class="btn" id="vin-auto">Check lot VINs with Nissan</button><button type="button" class="btn ghost sm" id="vin-auto-stop" hidden>Stop</button></div>
-      <div id="vin-auto-out"><p class="legend">Asks Nissan's recall lookup about every lot car that hasn't been checked in the last 7 days and saves each car's open campaign numbers. Keep this page open while it runs.</p></div>
+      <div id="vin-auto-out"><p class="legend">Asks Nissan's recall lookup about lot cars not checked in the last 7 days and saves each car's open campaign numbers. Nissan only answers a few at a time from the website; the lot scanner checks the rest every hour. Keep this page open while it runs.</p></div>
       <div class="field"><label class="label" for="vin-in">Results to save</label>
         <textarea id="vin-in" rows="5" spellcheck="false" autocomplete="off" placeholder="One VIN per line with its open campaign numbers, for example:&#10;5N1BT3BB2PC836400: R25E2&#10;3N1AB8CV5MY123456: none"></textarea></div>
       <div id="vin-preview"></div>
@@ -2357,6 +2357,17 @@ function scanProblems() {
   return [...S.dealers.entries()].filter(([id, d]) => !d.website || (sd[id] && (sd[id].s !== "ok" || sd[id].m === "home")))
     .map(([id, d]) => ({ id, d, s: sd[id] || { s: d.website ? "" : "nosite" } })).sort((a, b) => a.d.name.localeCompare(b.d.name));
 }
+/** How the scanner's own recall checks by VIN are going (scanner/status.recalls, written on each run). */
+function scanRecallLine(r) {
+  if (!r || !r.at) return `<p class="legend">Recall checks: the scanner hasn't checked any VINs with Nissan yet.</p>`;
+  const bits = [`last ran ${esc(ago(r.at))}`];
+  if (r.ran || r.failed) bits.push(`${r.ran || 0} checked${r.failed ? `, ${r.failed} couldn't be checked` : ""} that run`);
+  if (typeof r.waiting === "number") bits.push(`${r.waiting} lot ${r.waiting === 1 ? "car" : "cars"} still waiting`);
+  const paused = r.pausedUntil && Date.parse(r.pausedUntil) > Date.now();
+  return `<p class="legend">Recall checks by VIN: ${bits.join(" · ")}.</p>` +
+    (paused ? `<p class="notice"><b>Recall checks are paused.</b>Nissan's lookup turned the scanner away; it tries again around ${esc(new Date(r.pausedUntil).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}.</p>`
+      : r.err ? `<p class="legend">${esc(r.err)}</p>` : "");
+}
 function renderScanPanel() {
   const el = $("#scan-sum"); if (!el) return;
   const sc = S.scan;
@@ -2365,6 +2376,7 @@ function renderScanPanel() {
   const stale = sc.updated && Date.now() - Date.parse(sc.updated) > 3 * 36e5;
   el.innerHTML = `<p class="kpis"><span><b>${n.ok || 0}</b>lots read</span>${n.home ? `<span><b>${n.home}</b>featured cars only</span>` : ""}<span><b>${(n.blocked || 0) + (n.unreadable || 0) + (n.error || 0)}</b>couldn't read</span><span><b>${[...S.dealers.values()].filter(d => !d.website).length}</b>no website</span><span><b>${[...S.lots.values()].reduce((k, l) => k + (l.cars || []).length, 0)}</b>Nissans found</span></p>
     <p class="legend">Last run ${esc(ago(sc.updated))}. ${sc.passDone ? `Last full pass finished ${esc(ago(sc.lastPassDone))}. The next one starts around ${esc(new Date(Date.parse(sc.passStart) + 4 * 36e5).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}.` : `Pass in progress: ${sc.cursor || 0} of ${sc.total || 0} dealers checked.`}</p>
+    ${scanRecallLine(sc.recalls)}
     ${stale ? `<p class="notice"><b>The scanner hasn't run in a while.</b>Open the scanner in Google Apps Script and check its Executions list for errors.</p>` : ""}`;
   const probs = scanProblems();
   $("#scan-prob-n").textContent = String(probs.length);
