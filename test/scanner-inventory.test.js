@@ -146,3 +146,11 @@ test("http to https or adding www is not a move", () => {
   assert.equal(r.movedTo, undefined);
   assert.equal(r.nissan.length, 4);
 });
+
+test("picks up the dealer's phone number from its homepage", () => {
+  const { ctx } = load((u) => (u === BASE + "/" ? '<a href="tel:+1-586-555-0142">Call us</a>' + listPage(featured) : u === BASE + "/inventory?make=Nissan" ? listPage(nissans) : null));
+  const r = ctx.runJobs_([new ctx.DealerJob({ id: "d1", name: "Example", website: BASE }, null, {})])[0];
+  assert.equal(r.phone, "(586) 555-0142");
+  const { ctx: c2 } = load((u) => (u === BASE + "/" ? '<script type="application/ld+json">{"@type":"AutoDealer","telephone":"(248) 555-0199"}</script>' : null));
+  assert.equal(c2.runJobs_([new c2.DealerJob({ id: "d1", name: "Example", website: BASE }, null, {})])[0].phone, "(248) 555-0199");
+});

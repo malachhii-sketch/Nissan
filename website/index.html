@@ -1274,7 +1274,7 @@ $("#sheet").addEventListener("click", e => {
   if (t.closest("#a-clear")) { clearAppt(); return; }
   if (t.closest("#l-save")) { if (openType === "dealer") saveDLog(); else saveLog(); return; }
   if (t.closest("#dc-save")) { saveDContact(); return; }
-  if (t.closest("#p-edit") || t.closest("#p-edit2")) { openDealerForm(openId); return; }
+  if (t.closest("#p-edit") || t.closest("#p-edit2") || t.closest("#p-edit3")) { openDealerForm(openId); return; }
   if (t.closest("#la-open")) { const f = $("#la-form"); if (f.hidden) renderLotAssign(openId); else { f.hidden = true; f.innerHTML = ""; } return; }
   if (t.closest("#la-cancel")) { const f = $("#la-form"); f.hidden = true; f.innerHTML = ""; return; }
   if (t.closest("#la-save")) { saveLotAssign(openId); return; }
@@ -1768,6 +1768,8 @@ function dealerHTML(id, d) {
   const phones = (d.phones || []).map(p => `<div class="cline">
       <span><span class="k">${esc(p.t)}</span><br><span class="v mono">${esc(p.n)}</span></span><span></span>
       <span class="acts"><a class="btn sm" href="tel:+1${digits(p.n).slice(-10)}">Call</a><button type="button" class="btn ghost sm" data-copy="${esc(p.n)}">Copy</button></span></div>`).join("");
+  const noPhone = (d.phones || []).length ? "" : `<div class="cline"><span><span class="k">Phone</span><br><span class="v muted">Not on file yet</span></span><span></span>
+      <span class="acts"><a class="btn quiet sm" href="https://www.google.com/search?q=${encodeURIComponent(`${d.name} ${d.addr || ""} ${d.city || ""} MI phone`)}" target="_blank" rel="noopener">Look it up ↗</a><button type="button" class="btn ghost sm" id="p-edit3"${dis()}>Add phone</button></span></div>`;
   const web = d.website ? `<div class="cline"><span><span class="k">Website</span><br><span class="v">${esc(d.website.replace(/^https?:\/\/(www\.)?/, "").replace(/\/$/, ""))}</span>${d.webGuess ? `<br><span class="legend">Found automatically by the scanner. If it's the wrong dealer, fix it under Edit details.</span>` : ""}</span><span></span>
       <span class="acts"><a class="btn quiet sm" href="${esc(d.website)}" target="_blank" rel="noopener">Open site ↗</a></span></div>`
     : `<div class="cline"><span><span class="k">Website</span><br><span class="v muted">Not on file yet</span><br><span class="legend">With a website, the scanner can check this lot.</span></span><span></span>
@@ -1792,7 +1794,7 @@ function dealerHTML(id, d) {
 
     <div class="panel" id="p-lot"></div>
 
-    <div class="panel"><h3>Contact</h3>${phones}${web}${inv}${addr}
+    <div class="panel"><h3>Contact</h3>${phones}${noPhone}${web}${inv}${addr}
       ${(d.phones || []).length ? "" : `<p class="notice">No phone number confirmed yet. Check the dealer's website and add it under "Who to talk to".</p>`}
       <p class="legend">From ${esc(d.source || "research")}${d.checked ? `, checked ${fmtDate(d.checked)}` : ""}. Call the main line and ask for the used car manager or service manager.</p>
     </div>
@@ -2452,7 +2454,7 @@ function campaignListRecords(t) {
     if (!VIN_RE17.test(vin) || !LIST_CODE.test(cells[i + 1] || "")) continue;
     const full = /^\d{4}$/.test(cells[i + 3] || "");
     const r = { vin, c: cells[i + 1].toUpperCase(), d: (cells[i + 2] && !VIN_RE17.test(cells[i + 2].toUpperCase())) ? cells[i + 2] : "" };
-    if (full) Object.assign(r, { y: cells[i + 3], mk: cells[i + 4] || "", md: cells[i + 5] || "", dn: cells[i + 6] || "", city: cells[i + 8] || "" });
+    if (full) Object.assign(r, { y: cells[i + 3], mk: cells[i + 4] || "", md: cells[i + 5] || "", dn: cells[i + 6] || "", street: cells[i + 7] || "", city: cells[i + 8] || "", zip: cells[i + 9] || "" });
     out.push(r);
     i += full ? 9 : 2;
   }
@@ -2464,7 +2466,7 @@ function parseCampaignList(t) {
   campaignListRecords(t).forEach(r => {
     const row = byVin.get(r.vin) || { vin: r.vin, open: [], src: "Nissan" };
     if (!row.open.some(o => o.c === r.c)) row.open.push(r.d ? { c: r.c, d: r.d } : { c: r.c });
-    if (r.dn && !row.seen) row.seen = r.city ? `${r.dn} · ${r.city}` : r.dn;
+    if (r.dn && !row.seen) { row.seen = r.city ? `${r.dn} · ${r.city}` : r.dn; row.lot = { dn: r.dn, street: r.street || "", city: r.city || "", zip: String(r.zip || "").slice(0, 5) }; row.car = { y: Number(r.y) || null, md: r.md || "" }; }
     byVin.set(r.vin, row);
   });
   // An entry whose VIN wasn't copied (the copy started partway through it): say so instead of guessing.
@@ -2474,6 +2476,70 @@ function parseCampaignList(t) {
       errors.push(`Skipped ${x} ${cells[i + 1] || ""} (${[cells[i + 2], cells[i + 4], cells[i + 5]].filter(Boolean).join(" · ")}): its VIN wasn't in what was copied.`);
   });
   return { rows: [...byVin.values()], errors };
+}
+/* Cars from a pasted campaign list are kept on their dealer (dealers/{id}.listed = [{ v, y, md, f }]) and shown with
+   that dealer's lot, in the Dealers tab like any other dealer. Dealers the CRM doesn't have yet are added. */
+function dKey(n) { return String(n || "").toLowerCase().replace(/&/g, " and ").replace(/['’.]/g, "").replace(/[^a-z0-9]+/g, " ").replace(/\b(llc|inc|co|company|corp|the)\b/g, " ").replace(/\s+/g, " ").trim(); }
+function streetNo(a) { const m = String(a || "").match(/^\s*(\d+)/); return m ? m[1] : ""; }
+/** The CRM dealer a list entry belongs to: same name (and town), same street number and ZIP, or a close name in the same town. */
+function findDealerId(lot) {
+  const k = dKey(lot.dn), city = String(lot.city || "").toLowerCase().trim(), no = streetNo(lot.street), zip = String(lot.zip || "").slice(0, 5);
+  const all = [...S.dealers.entries()];
+  const sameCity = d => { const dc = String(d.city || "").toLowerCase().trim(); return !dc || !city || dc === city; };
+  let hit = all.find(([, d]) => k && dKey(d.name) === k && sameCity(d));
+  if (!hit && no && zip) hit = all.find(([, d]) => streetNo(d.addr) === no && String(d.zip || "").slice(0, 5) === zip);
+  if (!hit) hit = all.find(([, d]) => { const dk = dKey(d.name); return dk && k && String(d.city || "").toLowerCase().trim() === city && Math.min(dk.length, k.length) >= 8 && (dk.startsWith(k) || k.startsWith(dk)); });
+  return hit ? hit[0] : null;
+}
+/** The dealer records to save for the list's cars: new dealers, and cars added to dealers the CRM already has. */
+function listDealerWrites(rows, now) {
+  const groups = new Map();
+  rows.forEach(r => {
+    if (!r.lot || !r.lot.dn) return;
+    const id = findDealerId(r.lot) || "new:" + dKey(r.lot.dn) + "|" + r.lot.city.toLowerCase();
+    const g = groups.get(id) || { id, lot: r.lot, cars: [] };
+    g.cars.push({ v: r.vin, y: (r.car && r.car.y) || null, md: (r.car && r.car.md) || "", f: now });
+    groups.set(id, g);
+  });
+  const writes = [], added = [], taken = new Set(S.dealers.keys());
+  let carsAdded = 0;
+  groups.forEach(g => {
+    let id = g.id, cur;
+    if (id.startsWith("new:")) {
+      const base = "d-" + slug(g.lot.dn + "-" + (g.lot.city || "")); id = base; let n = 2;
+      while (taken.has(id)) id = base + "-" + n++;
+      taken.add(id);
+      cur = { name: g.lot.dn, city: g.lot.city, addr: g.lot.street, zip: g.lot.zip, state: "MI", website: null, phones: [], brands: [],
+        source: "Campaign list", checked: localISO(), addedBy: S.me.email || null, listedSince: now };
+      added.push(g.lot.dn);
+    } else {
+      cur = Object.assign({}, S.dealers.get(id));
+      if (!cur.addr && g.lot.street) cur.addr = g.lot.street;
+      if (!cur.zip && g.lot.zip) cur.zip = g.lot.zip;
+      if (!cur.listedSince) cur.listedSince = now;
+    }
+    const listed = (cur.listed || []).slice(), have = new Set(listed.map(c => c.v));
+    ((S.lotsRaw && S.lotsRaw.get(id)) || { cars: [] }).cars.forEach(c => have.add(c.v)); // already on its scanned lot
+    const fresh = g.cars.filter(c => !have.has(c.v) && (have.add(c.v), true));
+    if (!fresh.length) return; // nothing new for this dealer
+    carsAdded += fresh.length;
+    cur.listed = listed.concat(fresh);
+    Object.assign(cur, { updatedAt: now, updatedBy: S.me.id || null, updatedByName: S.me.name || null });
+    writes.push(["dealers", id, cur]);
+  });
+  return { writes, added, carsAdded };
+}
+/** The lots as shown: what the scanner found, plus each dealer's cars from campaign lists. */
+function rebuildLots() {
+  const m = new Map(S.lotsRaw || []);
+  S.dealers.forEach((d, id) => {
+    const extra = Array.isArray(d.listed) ? d.listed : [];
+    if (!extra.length) return;
+    const lot = m.get(id), cars = lot ? (lot.cars || []).slice() : [], have = new Set(cars.map(c => c.v));
+    extra.forEach(c => { if (c && c.v && !have.has(c.v)) { cars.push(Object.assign({ listed: true }, c)); have.add(c.v); } });
+    m.set(id, Object.assign({ dealer: id, name: d.name || "", since: d.listedSince || null, gone: [] }, lot || {}, { cars }));
+  });
+  S.lots = m;
 }
 /** Reads results to save: a JSON list ([{ vin, open: [{ c, d, a, ss, pr }] }]) or lines like "VIN: R25E2, PC948" / "VIN: none". */
 function parseVinResults(text) {
@@ -2537,6 +2603,7 @@ function renderVinPreview() {
   const where = r => { const x = at.get(r.vin); if (!x) return r.seen ? `Listed at ${esc(r.seen)} · not on a scanned lot yet` : "not on any lot or customer yet"; return x.kind === "lot" ? `${esc((S.dealers.get(x.id) || {}).name || x.id)} · ${esc(carName(x.c))}` : `customer ${esc((S.customers.get(x.id) || {}).name || "")} · ${esc(carName(x.c))}`; };
   out.innerHTML = (errors.length ? `<p class="err">${errors.slice(0, 5).map(esc).join("<br>")}${errors.length > 5 ? `<br>…and ${errors.length - 5} more` : ""}</p>` : "") +
     (rows.length ? `<div class="vin-rows">${rows.slice(0, 300).map(r => `<div class="cline"><span><span class="mono">${esc(r.vin)}</span><br><span class="legend">${where(r)}</span></span><span class="rc-row">${r.open.length ? campChips(r.open, 6) : `<span class="okline">No open campaigns</span>`}</span></div>`).join("")}</div>
+      ${(() => { const plan = listDealerWrites(rows, nowISO()); return plan.carsAdded ? `<p class="legend">Also adds ${plural(plan.carsAdded, "car")} to dealer lots${plan.added.length ? `, and ${plural(plan.added.length, "new dealer")} to the Dealers tab: ${esc(plan.added.slice(0, 8).join(", "))}${plan.added.length > 8 ? ` and ${plan.added.length - 8} more` : ""}` : ""}.</p>` : ""; })()}
       <div class="row"><button type="button" class="btn" id="vin-save"${dis()}>Save ${plural(rows.length, "result")}</button><span class="legend">${rows.filter(r => r.open.length).length} with open campaigns · ${rows.filter(r => !r.open.length).length} with none</span></div>` : "");
 }
 $("#vin-in").addEventListener("input", renderVinPreview);
@@ -2549,12 +2616,15 @@ $("#vin-preview").addEventListener("click", async e => {
     if (cur.removed === true) Object.assign(d, { removed: true, removedAt: cur.removedAt || null, removedByName: cur.removedByName || null });
     if (r.seen) d.seen = r.seen; // the dealer the list shows the car at
     return ["vinchecks", r.vin, d]; });
+  const plan = listDealerWrites(vinParsed.rows, now);
   try {
-    await commitWrites(writes, n => { btn.textContent = `Saving… ${n} of ${writes.length}`; });
+    await commitWrites(writes.concat(plan.writes), n => { btn.textContent = `Saving… ${Math.min(n, writes.length + plan.writes.length)} of ${writes.length + plan.writes.length}`; });
     writes.forEach(([, id, d]) => S.vchk.set(id, d));
+    plan.writes.forEach(([, id, d]) => S.dealers.set(id, d));
+    rebuildLots();
     $("#vin-in").value = ""; vinParsed = null;
     const none = writes.filter(([, , d]) => !d.open.length).length;
-    $("#vin-preview").innerHTML = `<p class="okmsg">Saved ${plural(writes.length, "VIN check")}. Cars with open campaigns now show them${none ? `; ${plural(none, "car")} with no recalls ${none === 1 ? "was" : "were"} taken off the list` : ""}.</p>`;
+    $("#vin-preview").innerHTML = `<p class="okmsg">Saved ${plural(writes.length, "VIN check")}. Cars with open campaigns now show them${none ? `; ${plural(none, "car")} with no recalls ${none === 1 ? "was" : "were"} taken off the list` : ""}.${plan.carsAdded ? ` Added ${plural(plan.carsAdded, "car")} to dealer lots${plan.added.length ? ` and ${plural(plan.added.length, "new dealer")} to the Dealers tab` : ""}. The scanner fills in their websites, phone numbers and map positions over the next few runs.` : ""}</p>`;
     toast("Recall checks saved"); renderAll2();
   } catch (err) {
     busy(btn, false);
@@ -2914,13 +2984,13 @@ function startData() {
     S.actsBy = by; S.got.activity = true; renderAll2();
   }, () => {});
   db.collection("dealers").limit(3000).onSnapshot(snap => {
-    S.dealers = new Map(snap.docs.map(d => [d.id, d.data()])); S.got.dealers = true; renderAll2();
+    S.dealers = new Map(snap.docs.map(d => [d.id, d.data()])); S.got.dealers = true; rebuildLots(); renderAll2();
   }, () => { S.got.dealers = true; renderAll2(); });
   db.collection("dcrm").limit(1000).onSnapshot(snap => {
     S.dcrm = new Map(snap.docs.map(d => [d.id, d.data()])); renderAll2();
   }, () => {});
   db.collection("lots").limit(3000).onSnapshot(snap => {
-    S.lots = new Map(snap.docs.map(d => [d.id, d.data()])); renderAll2();
+    S.lotsRaw = new Map(snap.docs.map(d => [d.id, d.data()])); rebuildLots(); renderAll2();
   }, () => {});
   db.collection("vinchecks").limit(5000).onSnapshot(snap => {
     S.vchk = new Map(snap.docs.map(d => [d.id, d.data()])); S.vchkDenied = false; renderAll2();

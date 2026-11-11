@@ -129,6 +129,7 @@ test("reads a pasted open-campaign list: one row per VIN with all its open campa
   assert.deepEqual(r.errors, []);
   assert.equal(r.rows.length, 3);
   assert.deepEqual(r.rows[1], { vin: "5N1AT2MV4EC836473", src: "Nissan", seen: "Suburban Auto Sales 2018 LLC · Madison Heights",
+    lot: { dn: "Suburban Auto Sales 2018 LLC", street: "26312 John R Road", city: "Madison Heights", zip: "48071" }, car: { y: 2014, md: "Rogue" },
     open: [{ c: "PC459", d: "LIFTGATE STAY" }, { c: "PC490", d: "CVT REPROGRAM" }, { c: "R21B9", d: "DASH SIDE HARNESS" }] });
   assert.deepEqual(r.rows[0].open, [{ c: "P0A08", d: "BRAKE FLUID FLUSH" }]);
 });
@@ -144,4 +145,47 @@ test("Campaign list copied as table rows, and an entry whose VIN wasn't copied",
   assert.equal(c.rows.length, 3, "the rest is still read");
   assert.equal(c.errors.length, 1);
   assert.match(c.errors[0], /Skipped P1A25 REAR O2 SENSOR \(2014 · Sentra · Toyota of Ann Arbor\): its VIN wasn't in what was copied/);
+});
+
+/* ---------- Adding dealers and cars from a pasted campaign list ---------- */
+function listCtx() {
+  const ctx = { console, JSON, String, Number, Array, Object, RegExp, Math, Map, Set, Date, VIN_RE17: /^[A-HJ-NPR-Z0-9]{17}$/,
+    slug: (s) => String(s || "").toLowerCase().replace(/['’]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60), localISO: () => "2026-11-11",
+    S: { me: { id: "u1", name: "Pat", email: "pat@example.com" }, dealers: new Map(), lotsRaw: new Map(), lots: new Map() } };
+  vm.createContext(ctx);
+  vm.runInContext(grab("const DBS_LABELS", "let vinParsed = null;") + "\nthis.f = { parse: parseVinResults, plan: listDealerWrites, find: findDealerId, rebuild: rebuildLots };", ctx);
+  return ctx;
+}
+const ENTRY = (vin, code, y, md, dealer, street, city, zip) => `${vin}\n${code}\nDESC ${code}\n${y}\t\nNissan\n${md}\n${dealer}\n${street}\n${city}\n${zip}\t\n\n`;
+
+test("a pasted list adds missing dealers and their cars, and matches dealers the CRM already has", () => {
+  const ctx = listCtx(), S = ctx.S;
+  S.dealers.set("d-golling-toyota", { name: "Golling Toyota", city: "Warren", addr: "", phones: [] });
+  S.dealers.set("d-galeanas", { name: "Galeana's Van Dyke Dodge", city: "Warren", addr: "28400 Van Dyke Ave", zip: "48093" });
+  S.lotsRaw.set("d-galeanas", { cars: [{ v: "KNMAT2MV3GP678076" }] });
+  const text = ENTRY("JN1BJ1CP6KW230858", "R22C9", 2019, "Rogue Sport", "Golling Toyota", "27100 Van Dyke Ave", "Warren", 48093) +
+    ENTRY("KNMAT2MV3GP678076", "PC490", 2016, "Rogue", "Galeana's Van Dyke Dodge-Ram", "28400 Van Dyke Ave", "Warren", 48093) +
+    ENTRY("JN1BJ1CP8JW196579", "P9327", 2018, "Rogue Sport", "Your Choice Auto Sales", "3332 Wyoming Avenue", "Dearborn", 48120) +
+    ENTRY("1N4AL4FV0LN307459", "R23C3", 2020, "Altima", "Your Choice Auto Sales", "3332 Wyoming Avenue", "Dearborn", 48120) +
+    ENTRY("1N4AL4FV0LN307459", "R25B1", 2020, "Altima", "Your Choice Auto Sales", "3332 Wyoming Avenue", "Dearborn", 48120);
+  const { rows } = ctx.f.parse(text);
+  const plan = JSON.parse(JSON.stringify(ctx.f.plan(rows, "2026-11-11T12:00:00Z")));
+  assert.deepEqual(plan.added, ["Your Choice Auto Sales"]);
+  assert.equal(plan.carsAdded, 3, "Galeana's car is already on its scanned lot");
+  const byId = Object.fromEntries(plan.writes.map(([, id, d]) => [id, d]));
+  assert.deepEqual(Object.keys(byId).sort(), ["d-golling-toyota", "d-your-choice-auto-sales-dearborn"]);
+  const yc = byId["d-your-choice-auto-sales-dearborn"];
+  assert.equal(yc.addr, "3332 Wyoming Avenue"); assert.equal(yc.city, "Dearborn"); assert.equal(yc.zip, "48120"); assert.equal(yc.source, "Campaign list");
+  assert.deepEqual(yc.listed.map((c) => [c.v, c.y, c.md]), [["JN1BJ1CP8JW196579", 2018, "Rogue Sport"], ["1N4AL4FV0LN307459", 2020, "Altima"]]);
+  assert.equal(byId["d-golling-toyota"].addr, "27100 Van Dyke Ave", "fills a missing address");
+  assert.ok(!JSON.stringify(plan).toLowerCase().includes("campaign list"));
+
+  // The cars then show on those dealers' lots, next to what the scanner found.
+  plan.writes.forEach(([, id, d]) => S.dealers.set(id, d));
+  ctx.f.rebuild();
+  assert.deepEqual(S.lots.get("d-your-choice-auto-sales-dearborn").cars.map((c) => c.v), ["JN1BJ1CP8JW196579", "1N4AL4FV0LN307459"]);
+  assert.deepEqual(S.lots.get("d-galeanas").cars.map((c) => c.v), ["KNMAT2MV3GP678076"]);
+
+  // Pasting the same list again adds nothing new.
+  assert.equal(ctx.f.plan(rows, "2026-11-12T12:00:00Z").writes.length, 0);
 });

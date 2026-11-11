@@ -24,7 +24,7 @@ const CONFIG = {
   recallEveryDays: 7,  // check each car on a lot again this often, to catch new recalls and finished repairs
 };
 
-const VERSION = "1.4";
+const VERSION = "1.5";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 NissanRecallLotScanner";
 
 /* =========================== Buttons you can run =========================== */
@@ -123,6 +123,10 @@ function scanInner_() {
       results.forEach(function (r, i) {
         const d = slice[i];
         if (r.skipped) return;
+        if (r.phone && !(d.phones || []).length) { // fill a missing phone number from the dealer's own homepage
+          d.phones = [{ t: "Main", n: r.phone }];
+          writes.push({ path: "dealers/" + d.id, data: { phones: d.phones }, fields: ["phones"] });
+        }
         if (r.movedTo && r.movedTo !== d.website) {
           writes.push({ path: "dealers/" + d.id, data: { website: r.movedTo }, fields: ["website"] });
           d.website = r.movedTo;
@@ -401,6 +405,16 @@ function cfsDetailLinks(html, base) {
   while ((m = re.exec(html || ""))) out[base + m[1]] = 1;
   return Object.keys(out);
 }
+/** The dealer's main phone number from its homepage: a "tel:" link, or the phone in its business details. */
+function phoneFromHtml(html) {
+  const h = String(html || "");
+  const cands = [];
+  let m; const tel = /href=["']tel:([^"']{10,30})["']/gi;
+  while ((m = tel.exec(h)) && cands.length < 5) cands.push(m[1]);
+  const ld = h.match(/"telephone"\s*:\s*"([^"]{10,30})"/i); if (ld) cands.unshift(ld[1]);
+  for (let i = 0; i < cands.length; i++) { const p = fmtPhone(decodeURIComponent(cands[i].replace(/%(?![0-9a-f]{2})/gi, ""))); if (p) return p; }
+  return "";
+}
 /** Same website, ignoring "www." and http/https. */
 function sameSite_(a, b) { const k = function (u) { return originOf(u).replace(/^https:\/\/(www\.)?/, ""); }; return !!a && k(a) === k(b); }
 /** Where a dealer's homepage permanently sends visitors, when it's another website (the dealership was sold or renamed). */
@@ -464,6 +478,7 @@ DealerJob.prototype.step = function (reqs, resps) {
     this.take_(reqs[0], home, "home"); // a homepage usually shows only a few featured cars
     this.homeHtml = home && home.code === 200 ? home.text : "";
     this.platform = fingerprint(this.homeHtml);
+    this.phone = phoneFromHtml(this.homeHtml);
     this.robots = robots && robots.code === 200 ? parseRobots(robots.text) : null;
     this.take_(reqs[2], sm, "sitemap");
     if (reqs[3] && reqs[3].tag !== "where") this.take_(reqs[3], resps[3], "page");
@@ -544,7 +559,7 @@ DealerJob.prototype.result = function () {
   else if (this.blocked && !this.reached) status = "blocked";
   else if (!this.reached) status = "error";
   else status = "unreadable";
-  const res = { status: status, platform: this.platform, anyCount: all.length, nissan: nissan, method: this.method || "" };
+  const res = { status: status, platform: this.platform, anyCount: all.length, nissan: nissan, method: this.method || "", phone: this.phone || "" };
   if (status === "ok" && this.cfsRead) {
     res.method = "carsforsale"; // read fresh each time: the list of Nissan pages changes as cars come and go
   } else if (status === "ok") {
@@ -649,11 +664,13 @@ function dealersFromMap(elements, existing, today) {
     const k = nameKey(name); if (!k) return;
     const osm = el.type + "/" + el.id, ll = [Math.round(lat * 1e5) / 1e5, Math.round(lon * 1e5) / 1e5];
     const web = t.website || t["contact:website"] || t.url || "";
+    const ph = fmtPhone(t.phone || t["contact:phone"]);
     const match = have.filter(function (h) { return h.osm === osm || (h.k === k && (!h.ll || milesBetween(h.ll, ll) < 1.5)); })[0];
     if (match) {
       // Fill in what the existing entry is missing.
       const f = {};
       if (!match.d.website && /^https?:\/\//i.test(web)) f.website = web;
+      if (!(match.d.phones || []).length && ph) f.phones = [{ t: "Main", n: ph }];
       if (!match.ll) { f.lat = ll[0]; f.lon = ll[1]; match.ll = ll; }
       if (!match.d.osm) f.osm = osm;
       if (Object.keys(f).length) { fills.push({ id: match.id, f: f }); Object.assign(match.d, f); }
@@ -663,7 +680,6 @@ function dealersFromMap(elements, existing, today) {
     let id = "d-" + slug_(name + (city ? "-" + city : "-" + el.id)), n = 2;
     while (takenIds[id]) id = "d-" + slug_(name + "-" + (city || el.id)) + "-" + n++;
     takenIds[id] = 1;
-    const ph = fmtPhone(t.phone || t["contact:phone"]);
     const d = {
       name: name, brands: String(t.brand || "").split(/[;,]/).map(function (s) { return s.trim(); }).filter(function (s) { return s && !/general motors/i.test(s); }),
       website: /^https?:\/\//i.test(web) ? web : null, phones: ph ? [{ t: "Main", n: ph }] : [],

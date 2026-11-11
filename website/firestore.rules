@@ -57,12 +57,12 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
     // Dealerships: the team adds and edits them; only admins delete them.
-    // The scanner may add dealers it finds on OpenStreetMap, and fill in a missing website or map position.
+    // The scanner may add dealers it finds on OpenStreetMap, and fill in a missing website, phone number or map position.
     match /dealers/{id} {
       allow read: if isMember();
       allow create: if isTeam() || (isScanner() && request.resource.data.source == 'OpenStreetMap');
       allow update: if isTeam() || (isScanner()
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['website', 'webGuess', 'lat', 'lon', 'osm']));
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['website', 'webGuess', 'lat', 'lon', 'osm', 'phones']));
       allow delete: if isAdmin();
     }
 
