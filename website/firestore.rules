@@ -1,0 +1,114 @@
+rules_version = '2';
+
+// Security rules for the Nissan Recall Finder CRM.
+// Paste all of this into Firebase: Build -> Firestore Database -> Rules (replace what's there), then click Publish.
+// The site owner's sign-in email is written into isOwner() and the team rule below.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null && request.auth.token.email != null;
+    }
+    function myEmail() {
+      return request.auth.token.email.lower();
+    }
+    function isOwner() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && myEmail() == 'malachhii@gmail.com';
+    }
+    function teamPath() {
+      return /databases/$(database)/documents/team/$(myEmail());
+    }
+    function isMember() {
+      return isOwner() || (
+        signedIn()
+        && exists(teamPath())
+        && get(teamPath()).data.active == true
+        && (get(teamPath()).data.get('requireVerify', false) != true
+            || request.auth.token.email_verified == true)
+      );
+    }
+    // The lot scanner robot: it may only read dealers and save what it finds on their lots.
+    function isScanner() {
+      return !isOwner() && isMember() && get(teamPath()).data.role == 'scanner';
+    }
+    // A person on the team (not the scanner robot).
+    function isTeam() {
+      return isMember() && !isScanner();
+    }
+    function isAdmin() {
+      return isOwner() || (isMember() && get(teamPath()).data.role == 'admin');
+    }
+
+    // Team list: the team can read it; admins manage it; nobody but the owner can change the owner's entry.
+    // Each person may update only their own sign-in stamp (uid, lastSeen).
+    // (The website's Netlify recall checker reads the caller's own entry here, with the caller's sign-in, to confirm access.)
+    match /team/{email} {
+      allow read: if isTeam() || (signedIn() && email == myEmail());
+      allow create, update, delete: if isOwner() || (isAdmin() && email != 'malachhii@gmail.com');
+      allow update: if signedIn() && email == myEmail() && resource.data.active == true
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['uid', 'lastSeen']);
+    }
+
+    // Customers: the team reads them; only admins import or change them.
+    match /customers/{id} {
+      allow read: if isTeam();
+      allow write: if isAdmin();
+    }
+    // Dealerships: the team adds and edits them; only admins delete them.
+    // The scanner may add dealers it finds on OpenStreetMap, and fill in a missing website or map position.
+    match /dealers/{id} {
+      allow read: if isMember();
+      allow create: if isTeam() || (isScanner() && request.resource.data.source == 'OpenStreetMap');
+      allow update: if isTeam() || (isScanner()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['website', 'webGuess', 'lat', 'lon', 'osm']));
+      allow delete: if isAdmin();
+    }
+
+    // Statuses, appointments and dealer contacts: the whole team works these.
+    match /crm/{id} {
+      allow read, write: if isTeam();
+    }
+    match /dcrm/{id} {
+      allow read, write: if isTeam();
+    }
+
+    // Contact log: anyone on the team adds entries in their own name; only admins edit or delete them.
+    match /activity/{id} {
+      allow read: if isTeam();
+      allow create: if isTeam() && (request.resource.data.by == request.auth.uid || isAdmin());
+      allow update, delete: if isAdmin();
+    }
+
+    // What the lot scanner finds: the team reads it; only the scanner (or an admin) writes it.
+    match /lots/{id} {
+      allow read: if isMember();
+      allow write: if isScanner() || isAdmin();
+    }
+    match /scanner/{id} {
+      allow read: if isMember();
+      allow write: if isScanner() || isAdmin();
+    }
+
+    // Open campaigns per VIN, as checked with Nissan (the website's "Check lot VINs with Nissan" button, or DBS):
+    // the team reads and saves these.
+    match /vinchecks/{vin} {
+      allow read: if isMember();
+      allow write: if isTeam();
+    }
+
+    // Techs and their daily assignments: the whole team plans and checks these off.
+    match /techs/{id} {
+      allow read, write: if isTeam();
+    }
+    match /jobs/{id} {
+      allow read, write: if isTeam();
+    }
+
+    // Everything else is closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

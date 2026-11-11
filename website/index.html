@@ -686,6 +686,8 @@ input[type="file"] { max-width: 100%; font-size: .9375rem; }
       <p class="legend">The open Nissan campaigns on each lot VIN, from Nissan's recall lookup or DBS. A saved result shows on that car everywhere in the CRM.</p>
       <div id="vin-sum"></div>
       <details class="gone"><summary>VINs to check (<span id="vin-todo-n">0</span>)</summary><div id="vin-todo"></div></details>
+      <div class="row"><button type="button" class="btn" id="vin-auto">Check lot VINs with Nissan</button><button type="button" class="btn ghost sm" id="vin-auto-stop" hidden>Stop</button></div>
+      <div id="vin-auto-out"><p class="legend">Asks Nissan's recall lookup about every lot car that hasn't been checked in the last 7 days and saves each car's open campaign numbers. Keep this page open while it runs.</p></div>
       <div class="field"><label class="label" for="vin-in">Results to save</label>
         <textarea id="vin-in" rows="5" spellcheck="false" autocomplete="off" placeholder="One VIN per line with its open campaign numbers, for example:&#10;5N1BT3BB2PC836400: R25E2&#10;3N1AB8CV5MY123456: none"></textarea></div>
       <div id="vin-preview"></div>
@@ -1406,12 +1408,38 @@ function carRecalls(c) { const k = carKey(c.md); if (!k || !c.y) return []; cons
    A checked car shows its exact open campaigns; an unchecked one says "Not checked yet". */
 const DBS_URL = "https://dbs.nnanet.com/dbsv3/NSHistory/searchNsh";
 function vdoc(vin) { return S.vchk.get(String(vin || "").toUpperCase()) || null; }
-function vcheck(vin) { const k = vdoc(vin); return k && k.at && Array.isArray(k.open) ? k : null; } // looked up with Nissan
+/* The lot scanner also checks each lot VIN with Nissan's lookup and saves the answer on the car
+   (lots/{id}.cars[]: rc = [{ n: NHTSA #, c: Nissan #, t: name, d: date }], rt = when checked). */
+let scanChkCache = { lots: null, map: null };
+function scanCheck(vin) {
+  if (scanChkCache.lots !== S.lots) {
+    const m = new Map();
+    S.lots.forEach(lot => ((lot && lot.cars) || []).forEach(c => {
+      if (!c || !c.v || !c.rt || !Array.isArray(c.rc)) return;
+      const prev = m.get(c.v); if (prev && prev.at >= c.rt) return;
+      const open = c.rc.map(r => {
+        const o = { c: String(r.c || r.n || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 10) };
+        if (r.t) o.d = r.t; if (/^\d{4}-\d{2}-\d{2}/.test(r.d || "")) o.a = r.d.slice(0, 10);
+        return o;
+      }).filter(o => o.c.length >= 3);
+      m.set(c.v, { v: c.v, at: c.rt, open, n: open.length, src: "Lot scanner" });
+    }));
+    scanChkCache = { lots: S.lots, map: m };
+  }
+  return scanChkCache.map.get(String(vin || "").toUpperCase()) || null;
+}
+// Looked up with Nissan: the newest of a saved check (button, paste or DBS) and the lot scanner's check.
+function vcheck(vin) {
+  const k = vdoc(vin), own = k && k.at && Array.isArray(k.open) ? k : null, sc = scanCheck(vin);
+  if (own && sc) return Date.parse(sc.at) > Date.parse(own.at) ? sc : own;
+  return own || sc;
+}
 // Off the lists: removed by hand, or checked with no open campaigns (unless someone put it back with Undo).
 function isRemoved(c) {
-  const k = vdoc(c.v); if (!k) return false;
+  const k = vdoc(c.v) || {};
   if (k.removed === true || k.removed === false) return k.removed;
-  return !!(k.at && Array.isArray(k.open) && !k.open.length);
+  const ck = vcheck(c.v);
+  return !!(ck && !ck.open.length);
 }
 function carOpen(c) { const k = vcheck(c.v); return k ? (k.open || []) : null; } // null: not checked yet
 function carNeeds(c) { const o = carOpen(c); return o ? o.length > 0 : carRecalls(c).length > 0; }
@@ -1421,7 +1449,7 @@ const removeBtn = (c, cls) => `<button type="button" class="btn ghost ${cls || "
   ((carOpen(c) || []).length ? "" : `<button type="button" class="btn ghost ${cls || "sm"}" data-vremove="${esc(c.v)}"${dis()}>Remove</button>`);
 function removedWhy(c) {
   const k = vdoc(c.v) || {};
-  if (k.removed !== true && vcheck(c.v)) return `No recalls found · checked ${esc(dbsDay(k))}`;
+  if (k.removed !== true && vcheck(c.v)) return `No recalls found · checked ${esc(dbsDay(vcheck(c.v)))}`;
   return `Removed${k.removedByName ? " by " + esc(k.removedByName) : ""}${k.removedAt ? " · " + esc(fmtDate(k.removedAt, { month: "short", day: "numeric" })) : ""}`;
 }
 function campChips(open, max) {
@@ -2395,6 +2423,7 @@ function renderVinPanel() {
     `<p class="kpis"><span><b>${checked.length}</b>lot cars checked</span><span><b>${checked.filter(x => (vcheck(x.c.v).open || []).length).length}</b>with open campaigns</span><span><b>${checked.filter(x => !(vcheck(x.c.v).open || []).length).length}</b>no recalls (taken off the list)</span><span><b>${todo.length}</b>not checked yet</span><span><b>${stale.length}</b>checked 30+ days ago</span></p>`;
   const list = todo.concat(stale);
   $("#vin-todo-n").textContent = String(list.length);
+  renderAutoBtn();
   const name = id => (S.dealers.get(id) || {}).name || id;
   $("#vin-todo").innerHTML = list.length ? `<div class="row"><button type="button" class="btn quiet sm" data-copy="${esc(list.map(x => x.c.v).join("\n"))}">Copy these VINs</button></div>` +
     list.slice(0, 400).map(x => { const k = vcheck(x.c.v); return `<div class="cline"><span><span class="mono">${esc(x.c.v)}</span> ${esc(carName(x.c))}<br><span class="legend"><button type="button" class="jname" data-dopen="${x.id}">${esc(name(x.id))}</button>${k ? ` · last checked ${esc(dbsDay(k))}` : ` · ${esc(carRecallText(x.c))}`}</span></span></div>`; }).join("")
@@ -2432,6 +2461,90 @@ $("#vin-preview").addEventListener("click", async e => {
     toast(err && err.code === "permission-denied" ? "Not saved: publish the new security rules in Firebase first." : "Not saved: " + authErr(err));
   }
 });
+/* ---------- "Check lot VINs with Nissan" ----------
+   Sends lot VINs, 4 at a time, to the site's Netlify Function (netlify/functions/nissan-recalls.mjs), which asks
+   Nissan's recall lookup, and saves each answer in vinchecks/{VIN}. A car Nissan doesn't answer for stays unchecked. */
+const AUTO_EVERY_DAYS = 7, AUTO_GROUP = 4, AUTO_FN = "/.netlify/functions/nissan-recalls";
+let autoRun = null;
+const pause = ms => new Promise(r => setTimeout(r, ms));
+/** Lot VINs due for a check: never checked first, then the oldest checks. Cars removed by hand are skipped. */
+function autoList() {
+  const cutoff = Date.now() - AUTO_EVERY_DAYS * 864e5, seen = new Set(), due = [];
+  S.lots.forEach(lot => ((lot && lot.cars) || []).forEach(c => {
+    if (!c || !VIN_RE17.test(c.v || "") || seen.has(c.v)) return;
+    seen.add(c.v);
+    if ((vdoc(c.v) || {}).removed === true) return;
+    const k = vcheck(c.v), t = k ? Date.parse(k.at) || 0 : 0;
+    if (t < cutoff) due.push({ v: c.v, t });
+  }));
+  return due.sort((a, b) => a.t - b.t || (a.v < b.v ? -1 : 1)).map(x => x.v);
+}
+function renderAutoBtn() {
+  const b = $("#vin-auto"); if (!b || autoRun) return;
+  const n = autoList().length;
+  b.textContent = n ? `Check ${plural(n, "lot VIN")} with Nissan` : "Every lot VIN was checked this week";
+  b.disabled = !n || !S.db || S.readOnly;
+}
+async function runAutoCheck() {
+  if (autoRun) return;
+  if (!S.db || S.readOnly || !auth || !auth.currentUser) { toast("Sign in to run recall checks."); return; }
+  const list = autoList();
+  if (!list.length) { toast(`Every lot VIN was checked in the last ${AUTO_EVERY_DAYS} days.`); return; }
+  const btn = $("#vin-auto"), stopBtn = $("#vin-auto-stop"), out = $("#vin-auto-out");
+  autoRun = { stop: false };
+  busy(btn, true, "Checking…"); stopBtn.hidden = false;
+  const tally = { open: 0, none: 0, failed: 0 };
+  let pending = [], why = "";
+  const flush = async () => {
+    if (!pending.length) return;
+    const w = pending; pending = [];
+    await commitWrites(w);
+    w.forEach(([, id, d]) => S.vchk.set(id, d));
+  };
+  const show = (i) => { out.innerHTML = `<p class="legend">Checked ${Math.min(i, list.length)} of ${list.length} · <b>${tally.open}</b> with open campaigns · ${tally.none} with none${tally.failed ? ` · ${tally.failed} couldn't be checked` : ""}</p>`; };
+  show(0);
+  try {
+    for (let i = 0; i < list.length; i += AUTO_GROUP) {
+      if (autoRun.stop) { why = "Stopped. Press the button again to pick up where it left off."; break; }
+      const group = list.slice(i, i + AUTO_GROUP);
+      let r, body = {};
+      try {
+        r = await fetch(AUTO_FN, { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + await auth.currentUser.getIdToken() }, body: JSON.stringify({ vins: group }) });
+        body = await r.json().catch(() => ({}));
+      } catch (e) { why = "Couldn't reach the recall checker. Check your connection and try again."; break; }
+      if (!r.ok) {
+        why = r.status === 404 ? "The recall checker isn't on the website yet. Deploy the site together with its netlify/functions folder." : (body.error || `The recall checker answered HTTP ${r.status}.`);
+        break;
+      }
+      const now = nowISO();
+      let blocked = false;
+      (body.results || []).forEach(x => {
+        if (!x || !group.includes(x.vin)) return;
+        if (!x.ok) { tally.failed++; if (x.blocked) blocked = true; return; }
+        const open = Array.isArray(x.open) ? x.open : [], cur = vdoc(x.vin) || {};
+        const d = { v: x.vin, open, n: open.length, src: "Nissan.com", at: now, updatedAt: now, updatedBy: S.me.id || null, updatedByName: S.me.name || null };
+        if (cur.removed === true || cur.removed === false) Object.assign(d, { removed: cur.removed, removedAt: cur.removedAt || null, removedByName: cur.removedByName || null });
+        pending.push(["vinchecks", x.vin, d]);
+        open.length ? tally.open++ : tally.none++;
+      });
+      if (pending.length >= 20) { await flush(); renderAll2(); }
+      show(i + group.length);
+      if (blocked) { why = "Nissan's lookup is refusing requests right now. Try again in a few hours."; break; }
+      if (tally.failed >= 8 && !(tally.open + tally.none)) { why = "Nissan's lookup isn't answering. Try again later."; break; }
+      await pause(600); // be polite to Nissan's site
+    }
+    await flush();
+  } catch (err) {
+    why = err && err.code === "permission-denied" ? "Not saved: your account can't save recall checks." : "Not saved: " + authErr(err);
+  }
+  const done = tally.open + tally.none;
+  out.innerHTML = `<p class="${why && !done ? "err" : "okmsg"}">${done ? `Saved ${plural(done, "VIN check")}: <b>${tally.open}</b> with open campaigns, ${tally.none} with none${tally.none ? " (taken off the lists)" : ""}.` : "Nothing was saved."}${tally.failed ? ` ${plural(tally.failed, "car")} couldn't be checked and will be tried next time.` : ""}${why ? " " + esc(why) : ""}</p>`;
+  autoRun = null; stopBtn.hidden = true; busy(btn, false);
+  if (done) toast("Recall checks saved");
+  renderAll2();
+}
+$("#vin-auto").addEventListener("click", runAutoCheck);
+$("#vin-auto-stop").addEventListener("click", () => { if (autoRun) { autoRun.stop = true; $("#vin-auto-stop").hidden = true; } });
 $("#scan-copy").addEventListener("click", () => {
   const sc = S.scan || {}, sd = sc.dealers || {};
   const lines = [`Lot scanner report · ${new Date().toLocaleString()}`, `Last run: ${sc.updated || "never"} · pass ${sc.pass || 0} · ${sc.cursor || 0}/${sc.total || 0}`];
