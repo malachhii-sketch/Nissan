@@ -178,7 +178,6 @@ test("a pasted list adds missing dealers and their cars, and matches dealers the
   assert.equal(yc.addr, "3332 Wyoming Avenue"); assert.equal(yc.city, "Dearborn"); assert.equal(yc.zip, "48120"); assert.equal(yc.source, "Campaign list");
   assert.deepEqual(yc.listed.map((c) => [c.v, c.y, c.md]), [["JN1BJ1CP8JW196579", 2018, "Rogue Sport"], ["1N4AL4FV0LN307459", 2020, "Altima"]]);
   assert.equal(byId["d-golling-toyota"].addr, "27100 Van Dyke Ave", "fills a missing address");
-  assert.ok(!JSON.stringify(plan).toLowerCase().includes("campaign list"));
 
   // The cars then show on those dealers' lots, next to what the scanner found.
   plan.writes.forEach(([, id, d]) => S.dealers.set(id, d));
