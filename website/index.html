@@ -2464,7 +2464,7 @@ $("#vin-preview").addEventListener("click", async e => {
 /* ---------- "Check lot VINs with Nissan" ----------
    Sends lot VINs, 4 at a time, to the site's Netlify Function (netlify/functions/nissan-recalls.mjs), which asks
    Nissan's recall lookup, and saves each answer in vinchecks/{VIN}. A car Nissan doesn't answer for stays unchecked. */
-const AUTO_EVERY_DAYS = 7, AUTO_GROUP = 4, AUTO_FN = "/.netlify/functions/nissan-recalls";
+const AUTO_EVERY_DAYS = 7, AUTO_GROUP = 3, AUTO_FN = "/.netlify/functions/nissan-recalls";
 let autoRun = null;
 const pause = ms => new Promise(r => setTimeout(r, ms));
 /** Lot VINs due for a check: never checked first, then the oldest checks. Cars removed by hand are skipped. */
@@ -2493,7 +2493,8 @@ async function runAutoCheck() {
   const btn = $("#vin-auto"), stopBtn = $("#vin-auto-stop"), out = $("#vin-auto-out");
   autoRun = { stop: false };
   busy(btn, true, "Checking…"); stopBtn.hidden = false;
-  const tally = { open: 0, none: 0, failed: 0 };
+  const tally = { open: 0, none: 0, failed: 0 }, reasons = {};
+  let dryGroups = 0; // groups in a row where Nissan answered for no car
   let pending = [], why = "";
   const flush = async () => {
     if (!pending.length) return;
@@ -2520,7 +2521,7 @@ async function runAutoCheck() {
       let blocked = false;
       (body.results || []).forEach(x => {
         if (!x || !group.includes(x.vin)) return;
-        if (!x.ok) { tally.failed++; if (x.blocked) blocked = true; return; }
+        if (!x.ok) { tally.failed++; const w = x.why || (x.code ? "HTTP " + x.code : "no answer"); reasons[w] = (reasons[w] || 0) + 1; if (x.blocked) blocked = true; return; }
         const open = Array.isArray(x.open) ? x.open : [], cur = vdoc(x.vin) || {};
         const d = { v: x.vin, open, n: open.length, src: "Nissan.com", at: now, updatedAt: now, updatedBy: S.me.id || null, updatedByName: S.me.name || null };
         if (cur.removed === true || cur.removed === false) Object.assign(d, { removed: cur.removed, removedAt: cur.removedAt || null, removedByName: cur.removedByName || null });
@@ -2530,15 +2531,16 @@ async function runAutoCheck() {
       if (pending.length >= 20) { await flush(); renderAll2(); }
       show(i + group.length);
       if (blocked) { why = "Nissan's lookup is refusing requests right now. Try again in a few hours."; break; }
-      if (tally.failed >= 8 && !(tally.open + tally.none)) { why = "Nissan's lookup isn't answering. Try again later."; break; }
-      await pause(600); // be polite to Nissan's site
+      dryGroups = (body.results || []).some(x => x && x.ok) ? 0 : dryGroups + 1;
+      if (dryGroups >= 2) { why = "Nissan's lookup stopped answering, so the check stopped. Try again later."; break; }
+      await pause(1500); // be gentle on Nissan's site
     }
     await flush();
   } catch (err) {
     why = err && err.code === "permission-denied" ? "Not saved: your account can't save recall checks." : "Not saved: " + authErr(err);
   }
   const done = tally.open + tally.none;
-  out.innerHTML = `<p class="${why && !done ? "err" : "okmsg"}">${done ? `Saved ${plural(done, "VIN check")}: <b>${tally.open}</b> with open campaigns, ${tally.none} with none${tally.none ? " (taken off the lists)" : ""}.` : "Nothing was saved."}${tally.failed ? ` ${plural(tally.failed, "car")} couldn't be checked and will be tried next time.` : ""}${why ? " " + esc(why) : ""}</p>`;
+  out.innerHTML = `<p class="${why && !done ? "err" : "okmsg"}">${done ? `Saved ${plural(done, "VIN check")}: <b>${tally.open}</b> with open campaigns, ${tally.none} with none${tally.none ? " (taken off the lists)" : ""}.` : "Nothing was saved."}${tally.failed ? ` ${plural(tally.failed, "car")} couldn't be checked and will be tried next time (${esc(Object.entries(reasons).map(([k, n]) => `${k}: ${n}`).join(", "))}).` : ""}${why ? " " + esc(why) : ""}</p>`;
   autoRun = null; stopBtn.hidden = true; busy(btn, false);
   if (done) toast("Recall checks saved");
   renderAll2();

@@ -15,7 +15,9 @@
 
 const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "macomb-recall-crm";
 const MAX_VINS = 4;
-const TIMEOUT_MS = 7000;
+const TIMEOUT_MS = 4000;   // per request to Nissan
+const BUDGET_MS = 8000;    // stay inside Netlify's 10-second limit for one call
+const GAP_MS = 350;        // pause between VINs, one at a time, to be gentle on Nissan's site
 
 // Nissan's public recall lookup. Its form posts the VIN to an address written in the page itself,
 // so that address is read from the page (it can change when Nissan edits the page).
@@ -78,7 +80,7 @@ export function recallUrlFromPage(html) {
 async function lookupUrl(fresh, fetchFn) {
   if (!fresh && lookup.url && Date.now() - lookup.at < 6 * 36e5) return lookup.url;
   try {
-    const res = await fetchFn(RECALL_PAGE, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const res = await fetchFn(RECALL_PAGE, { signal: AbortSignal.timeout(3000) });
     const u = res.ok ? recallUrlFromPage(await res.text()) : "";
     if (u) { lookup = { url: u, at: Date.now() }; return u; }
   } catch (e) { /* keep what we have */ }
@@ -113,7 +115,17 @@ export function parseRecallAnswer(status, text, vin) {
     return { vin, ok: true, code: status, open };
   }
   if (status === 404 && j && /not found|no data/i.test(`${j.status_code || ""} ${j.status_message || ""}`)) return { vin, ok: true, code: status, open: [] };
-  return { vin, ok: false, code: status, blocked: status === 403 || status === 429, open: [] };
+  return { vin, ok: false, code: status, blocked: status === 403 || status === 429, why: failWhy(status, text), open: [] };
+}
+
+/** A short reason for a failed lookup, shown in the CRM and the function log. */
+export function failWhy(status, text) {
+  const t = String(text || "");
+  if (status === 0) return "no answer";
+  if (status === 403 || status === 429) return "refused";
+  if (/<html|<!doctype/i.test(t)) return /captcha|access denied|reference #|akamai|bot/i.test(t) ? "bot check page" : "web page instead of data";
+  if (status >= 500) return "Nissan server error";
+  return "unexpected answer";
 }
 
 async function ask(url, vin, fetchFn) {
@@ -124,19 +136,38 @@ async function ask(url, vin, fetchFn) {
       body: new URLSearchParams({ vinNums: JSON.stringify([vin]) }).toString(),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
-    return parseRecallAnswer(res.status, await res.text(), vin);
+    const text = await res.text();
+    const a = parseRecallAnswer(res.status, text, vin);
+    if (!a.ok) console.log(`Nissan lookup failed for ${vin}: HTTP ${res.status} (${a.why}) ${text.replace(/\s+/g, " ").slice(0, 200)}`);
+    return a;
   } catch (e) {
-    return { vin, ok: false, code: 0, open: [] };
+    console.log(`Nissan lookup failed for ${vin}: ${(e && (e.name + " " + e.message)) || e}`);
+    return { vin, ok: false, code: 0, why: "no answer", open: [] };
   }
 }
 
-export async function checkVins(vins, fetchFn = fetch) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const skipped = (vin) => ({ vin, ok: false, code: 0, why: "out of time", open: [] });
+
+/** Asks about the VINs one at a time, stopping when Nissan refuses or time runs out. */
+async function askEach(url, vins, fetchFn, deadline) {
+  const out = [];
+  for (const v of vins) {
+    if (out.some((r) => r.blocked) || Date.now() + TIMEOUT_MS > deadline) { out.push(skipped(v)); continue; }
+    if (out.length) await sleep(GAP_MS);
+    out.push(await ask(url, v, fetchFn));
+  }
+  return out;
+}
+
+export async function checkVins(vins, fetchFn = fetch, start = Date.now()) {
+  const deadline = start + BUDGET_MS;
   let url = await lookupUrl(false, fetchFn);
-  let results = await Promise.all(vins.map((v) => ask(url, v, fetchFn)));
+  let results = await askEach(url, vins, fetchFn, deadline);
   // Nothing could be read and Nissan isn't refusing us: the lookup may have moved. Read its address again, once.
-  if (results.every((r) => !r.ok && !r.blocked)) {
+  if (results.every((r) => !r.ok && !r.blocked && r.why !== "out of time") && Date.now() + 2 * TIMEOUT_MS < deadline) {
     const u2 = await lookupUrl(true, fetchFn);
-    if (u2 !== url) results = await Promise.all(vins.map((v) => ask(u2, v, fetchFn)));
+    if (u2 !== url) results = await askEach(u2, vins, fetchFn, deadline);
   }
   return results;
 }
@@ -144,6 +175,7 @@ export async function checkVins(vins, fetchFn = fetch) {
 /* ---------- handler ---------- */
 
 export async function handle(req, fetchFn = fetch) {
+  const start = Date.now();
   if (req.method !== "POST") return json(405, { error: "Use POST." });
   const who = await checkCaller(req.headers.get("authorization"), fetchFn);
   if (!who.ok) return json(who.status, { error: who.error });
@@ -153,7 +185,7 @@ export async function handle(req, fetchFn = fetch) {
     .filter((v) => VIN_RE.test(v));
   if (!vins.length) return json(400, { error: "Send { vins: [...] } with at least one 17-character VIN." });
   if (vins.length > MAX_VINS) return json(400, { error: `Send at most ${MAX_VINS} VINs per request.` });
-  return json(200, { results: await checkVins(vins, fetchFn) });
+  return json(200, { results: await checkVins(vins, fetchFn, start) });
 }
 
 export default (req) => handle(req);

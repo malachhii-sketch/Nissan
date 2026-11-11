@@ -97,3 +97,27 @@ test("checks each VIN and reports the ones Nissan didn't answer", async () => {
   bad = await f.handle(req({ vins: [VIN_A, VIN_B, "1N4AL3AP8JC231503", "JN8AT2MV9HW000000", "5N1AT2MV0HC000001"] }, auth), ff.fn);
   assert.equal(bad.status, 400, "more than 4 VINs");
 });
+
+test("asks one VIN at a time, explains failures, and stays inside the time limit", async () => {
+  const f = await load();
+  assert.equal(f.failWhy(0, ""), "no answer");
+  assert.equal(f.failWhy(200, "<html><title>Access Denied</title>Reference #18.abc"), "bot check page");
+  assert.equal(f.failWhy(200, "<!DOCTYPE html><p>Owners</p>"), "web page instead of data");
+  assert.equal(f.failWhy(502, ""), "Nissan server error");
+  assert.equal(f.parseRecallAnswer(200, "<html>", VIN_A).why, "web page instead of data");
+
+  let inFlight = 0, most = 0;
+  const slowFetch = async (url, opts = {}) => {
+    if (url.endsWith("recalls-vin.html")) return resp(200, PAGE);
+    inFlight++; most = Math.max(most, inFlight);
+    await new Promise((r) => setTimeout(r, 5));
+    inFlight--;
+    return resp(404, NONE);
+  };
+  const r = await f.checkVins([VIN_A, VIN_B], slowFetch);
+  assert.equal(most, 1, "never two lookups at once");
+  assert.ok(r.every((x) => x.ok));
+
+  const late = await f.checkVins([VIN_A, VIN_B], slowFetch, Date.now() - 7000);
+  assert.ok(late.every((x) => !x.ok && x.why === "out of time"), "doesn't start a lookup it can't finish in time");
+});

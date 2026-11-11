@@ -44,12 +44,12 @@ test("button checks due VINs in groups of 4, saves answers, leaves failures unch
   S.vchk.set(V(4), { v: V(4), at: ago(30), open: [], removed: false }); // put back by hand, old check
   assert.deepEqual([...s.ctx.f.autoList()], [V(0), V(1), V(2), V(3), V(4)]);
   await s.ctx.f.runAutoCheck();
-  assert.deepEqual(s.posts.map(p => p.length), [4, 1]);
+  assert.deepEqual(s.posts.map(p => p.length), [3, 2]);
   const saved = Object.fromEntries(s.writes.map(([c, id, d]) => [id, d]));
   assert.deepEqual(Object.keys(saved).sort(), [V(0), V(1), V(2), V(4)]);
   assert.equal(saved[V(0)].open[0].c, "PC735"); assert.equal(saved[V(0)].src, "Nissan.com"); assert.equal(saved[V(0)].updatedByName, "Pat");
   assert.equal(saved[V(4)].removed, false, "keeps a by-hand 'put back'");
-  assert.match(s.els["vin-auto-out"].innerHTML, /Saved 4 VIN checks: <b>1<\/b> with open campaigns, 3 with none.*1 car couldn't be checked/);
+  assert.match(s.els["vin-auto-out"].innerHTML, /Saved 4 VIN checks: <b>1<\/b> with open campaigns, 3 with none.*1 car couldn't be checked and will be tried next time \(HTTP 500: 1\)/);
   assert.deepEqual([...s.ctx.f.autoList()], [V(3)], "next run: only the failed car");
 });
 
@@ -62,4 +62,13 @@ test("stops when Nissan refuses, and explains a missing function", async () => {
   s.ctx.S.lots.set("d1", { cars: [{ v: V(0) }] });
   await s.ctx.f.runAutoCheck();
   assert.match(s.els["vin-auto-out"].innerHTML, /isn't on the website yet/);
+});
+
+test("stops after two groups in a row with no answers, even after earlier successes", async () => {
+  let n = 0;
+  const s = setup(vins => { n++; return { status: 200, body: { results: vins.map(v => n === 1 ? { vin: v, ok: true, open: [] } : { vin: v, ok: false, code: 0, why: "no answer", open: [] }) } }; });
+  s.ctx.S.lots.set("d1", { cars: Array.from({ length: 30 }, (_, i) => ({ v: "5N1BT3BB2PC8364" + String(i).padStart(2, "0") })) });
+  await s.ctx.f.runAutoCheck();
+  assert.equal(s.posts.length, 3, "one good group, then two empty ones");
+  assert.match(s.els["vin-auto-out"].innerHTML, /Saved 3 VIN checks.*6 cars couldn't be checked.*\(no answer: 6\).*stopped answering/);
 });
