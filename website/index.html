@@ -689,7 +689,7 @@ input[type="file"] { max-width: 100%; font-size: .9375rem; }
       <div class="row"><button type="button" class="btn" id="vin-auto">Check lot VINs with Nissan</button><button type="button" class="btn ghost sm" id="vin-auto-stop" hidden>Stop</button></div>
       <div id="vin-auto-out"><p class="legend">Asks Nissan's recall lookup about lot cars not checked in the last 7 days and saves each car's open campaign numbers. Nissan only answers a few at a time from the website; the lot scanner checks the rest every hour. Keep this page open while it runs.</p></div>
       <div class="field"><label class="label" for="vin-in">Results to save</label>
-        <textarea id="vin-in" rows="5" spellcheck="false" autocomplete="off" placeholder="Paste DBS vehicle pages here: in DBS, open the car, expand Open Campaign Information, press Ctrl+A then Ctrl+C. You can paste several cars one after another.&#10;Or type one VIN per line with its open campaigns:&#10;5N1BT3BB2PC836400: R25E2&#10;3N1AB8CV5MY123456: none"></textarea></div>
+        <textarea id="vin-in" rows="5" spellcheck="false" autocomplete="off" placeholder="Paste an open-campaign list, or DBS vehicle pages: in DBS, open the car, expand Open Campaign Information, press Ctrl+A then Ctrl+C. You can paste several cars one after another.&#10;Or type one VIN per line with its open campaigns:&#10;5N1BT3BB2PC836400: R25E2&#10;3N1AB8CV5MY123456: none"></textarea></div>
       <div id="vin-preview"></div>
     </div>
     <div class="panel">
@@ -2441,11 +2441,46 @@ function parseDbsText(t) {
   });
   return { rows, errors };
 }
+/* ---------- Open-campaign lists pasted as text ----------
+   Each car/campaign is: VIN, campaign #, description, year, make, model, dealer, street, city, ZIP (one per line, or as a
+   table row with tabs). A VIN with several open campaigns is listed once per campaign. */
+const LIST_CODE = /^(?=.*\d)[A-Z0-9]{4,6}$/;
+function campaignListRecords(t) {
+  const cells = String(t || "").split(/[\n\t]+/).map(x => x.trim()).filter(Boolean), out = [];
+  for (let i = 0; i < cells.length; i++) {
+    const vin = cells[i].toUpperCase();
+    if (!VIN_RE17.test(vin) || !LIST_CODE.test(cells[i + 1] || "")) continue;
+    const full = /^\d{4}$/.test(cells[i + 3] || "");
+    const r = { vin, c: cells[i + 1].toUpperCase(), d: (cells[i + 2] && !VIN_RE17.test(cells[i + 2].toUpperCase())) ? cells[i + 2] : "" };
+    if (full) Object.assign(r, { y: cells[i + 3], mk: cells[i + 4] || "", md: cells[i + 5] || "", dn: cells[i + 6] || "", city: cells[i + 8] || "" });
+    out.push(r);
+    i += full ? 9 : 2;
+  }
+  return out;
+}
+function looksLikeCampaignList(t) { return !/Campaign\s*#\s*:/i.test(t) && campaignListRecords(t).length >= 2 && !/^[A-HJ-NPR-Z0-9]{17}\s*[:|,-]/im.test(t); }
+function parseCampaignList(t) {
+  const byVin = new Map();
+  campaignListRecords(t).forEach(r => {
+    const row = byVin.get(r.vin) || { vin: r.vin, open: [], src: "Nissan" };
+    if (!row.open.some(o => o.c === r.c)) row.open.push(r.d ? { c: r.c, d: r.d } : { c: r.c });
+    if (r.dn && !row.seen) row.seen = r.city ? `${r.dn} · ${r.city}` : r.dn;
+    byVin.set(r.vin, row);
+  });
+  // An entry whose VIN wasn't copied (the copy started partway through it): say so instead of guessing.
+  const cells = String(t || "").split(/[\n\t]+/).map(x => x.trim()).filter(Boolean), errors = [];
+  cells.forEach((x, i) => {
+    if (LIST_CODE.test(x) && /^\d{4}$/.test(cells[i + 2] || "") && !VIN_RE17.test((cells[i - 1] || "").toUpperCase()))
+      errors.push(`Skipped ${x} ${cells[i + 1] || ""} (${[cells[i + 2], cells[i + 4], cells[i + 5]].filter(Boolean).join(" · ")}): its VIN wasn't in what was copied.`);
+  });
+  return { rows: [...byVin.values()], errors };
+}
 /** Reads results to save: a JSON list ([{ vin, open: [{ c, d, a, ss, pr }] }]) or lines like "VIN: R25E2, PC948" / "VIN: none". */
 function parseVinResults(text) {
   const t = String(text || "").trim(), rows = [], errors = [];
   if (!t) return { rows, errors };
   if (looksLikeDbs(t)) return parseDbsText(t);
+  if (looksLikeCampaignList(t)) return parseCampaignList(t);
   const camp = x => typeof x === "string" ? { c: x.trim().toUpperCase() } : {
     c: String(x.c || x.code || x.campaign || "").trim().toUpperCase(), d: String(x.d || x.desc || x.description || "").trim(),
     a: String(x.a || x.activation || x.date || "").slice(0, 10), ss: !!(x.ss ?? x.stopSale), pr: !!(x.pr ?? x.partsRestriction),
@@ -2499,7 +2534,7 @@ function renderVinPreview() {
   const { rows, errors } = vinParsed;
   if (!rows.length && !errors.length) { out.innerHTML = ""; return; }
   const at = vinIndex();
-  const where = r => { const x = at.get(r.vin); if (!x) return "not on any lot or customer yet"; return x.kind === "lot" ? `${esc((S.dealers.get(x.id) || {}).name || x.id)} · ${esc(carName(x.c))}` : `customer ${esc((S.customers.get(x.id) || {}).name || "")} · ${esc(carName(x.c))}`; };
+  const where = r => { const x = at.get(r.vin); if (!x) return r.seen ? `Listed at ${esc(r.seen)} · not on a scanned lot yet` : "not on any lot or customer yet"; return x.kind === "lot" ? `${esc((S.dealers.get(x.id) || {}).name || x.id)} · ${esc(carName(x.c))}` : `customer ${esc((S.customers.get(x.id) || {}).name || "")} · ${esc(carName(x.c))}`; };
   out.innerHTML = (errors.length ? `<p class="err">${errors.slice(0, 5).map(esc).join("<br>")}${errors.length > 5 ? `<br>…and ${errors.length - 5} more` : ""}</p>` : "") +
     (rows.length ? `<div class="vin-rows">${rows.slice(0, 300).map(r => `<div class="cline"><span><span class="mono">${esc(r.vin)}</span><br><span class="legend">${where(r)}</span></span><span class="rc-row">${r.open.length ? campChips(r.open, 6) : `<span class="okline">No open campaigns</span>`}</span></div>`).join("")}</div>
       <div class="row"><button type="button" class="btn" id="vin-save"${dis()}>Save ${plural(rows.length, "result")}</button><span class="legend">${rows.filter(r => r.open.length).length} with open campaigns · ${rows.filter(r => !r.open.length).length} with none</span></div>` : "");
@@ -2512,6 +2547,7 @@ $("#vin-preview").addEventListener("click", async e => {
   const now = nowISO();
   const writes = vinParsed.rows.map(r => { const cur = vdoc(r.vin) || {}; const d = { v: r.vin, open: r.open, n: r.open.length, src: r.src || "Nissan", at: now, updatedAt: now, updatedBy: S.me.id || null, updatedByName: S.me.name || null };
     if (cur.removed === true) Object.assign(d, { removed: true, removedAt: cur.removedAt || null, removedByName: cur.removedByName || null });
+    if (r.seen) d.seen = r.seen; // the dealer the list shows the car at
     return ["vinchecks", r.vin, d]; });
   try {
     await commitWrites(writes, n => { btn.textContent = `Saving… ${n} of ${writes.length}`; });

@@ -115,3 +115,33 @@ test("a campaign DBS shows as repaired isn't counted as open; typed lines still 
   assert.deepEqual(dbsParse(TOP("1N4AL3AP1FC286673", "1 Active Campaign(s)") + done).rows[0].open, []);
   assert.deepEqual(dbsParse("5N1BT3BB2PC836400: R25E2\n3N1AB8CV5MY123456: none").rows.map((x) => x.open.length), [1, 0]);
 });
+
+/* ---------- Open-campaign lists pasted as text ---------- */
+const VX = (vin, code, desc, y, md, dealer, street, city, zip) => `${vin}\n${code}\n${desc}\n${y}\t\nNissan\n${md}\n${dealer}\n${street}\n${city}\n${zip}\t\n\n\n`;
+const LIST = VX("JN8AZ1MW7EW526861", "P0A08", "BRAKE FLUID FLUSH", 2014, "Murano", "Decisive Auto Sales", "8105 Smiley Ave", "Shelby Township", 48316) +
+  VX("5N1AT2MV4EC836473", "PC459", "LIFTGATE STAY", 2014, "Rogue", "Suburban Auto Sales 2018 LLC", "26312 John R Road", "Madison Heights", 48071) +
+  VX("5N1AT2MV4EC836473", "PC490", "CVT REPROGRAM", 2014, "Rogue", "Suburban Auto Sales 2018 LLC", "26312 John R Road", "Madison Heights", 48071) +
+  VX("5N1AT2MV4EC836473", "R21B9", "DASH SIDE HARNESS", 2014, "Rogue", "Suburban Auto Sales 2018 LLC", "26312 John R Road", "Madison Heights", 48071) +
+  VX("1N4AL4FV0LN307459", "R23C3", "REAR-VIEW CAMERA", 2020, "Altima", "Your Choice Auto Sales", "3332 Wyoming Avenue", "Dearborn", 48120);
+
+test("reads a pasted open-campaign list: one row per VIN with all its open campaigns", () => {
+  const r = dbsParse(LIST);
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.rows.length, 3);
+  assert.deepEqual(r.rows[1], { vin: "5N1AT2MV4EC836473", src: "Nissan", seen: "Suburban Auto Sales 2018 LLC · Madison Heights",
+    open: [{ c: "PC459", d: "LIFTGATE STAY" }, { c: "PC490", d: "CVT REPROGRAM" }, { c: "R21B9", d: "DASH SIDE HARNESS" }] });
+  assert.deepEqual(r.rows[0].open, [{ c: "P0A08", d: "BRAKE FLUID FLUSH" }]);
+});
+
+test("Campaign list copied as table rows, and an entry whose VIN wasn't copied", () => {
+  const rows = "JN1BJ1CP8JW196579\tP9327\tAEB\t2018\tNissan\tRogue Sport\tYour Choice Auto Sales\t3332 Wyoming Avenue\tDearborn\t48120\n" +
+    "5N1AT3BB1MC734206\tPD108\tEEM LOGIC\t2021\tNissan\tRogue\tYour Choice Auto Sales\t3332 Wyoming Avenue\tDearborn\t48120\n";
+  const r = dbsParse(rows);
+  assert.deepEqual(r.rows.map((x) => [x.vin, x.open[0].c, x.seen]), [["JN1BJ1CP8JW196579", "P9327", "Your Choice Auto Sales · Dearborn"], ["5N1AT3BB1MC734206", "PD108", "Your Choice Auto Sales · Dearborn"]]);
+
+  const cut = "P1A25\nREAR O2 SENSOR\n2014\t\nNissan\nSentra\nToyota of Ann Arbor\n3745 Jackson Road\nAnn Arbor\n48103\t\n\n\n" + LIST;
+  const c = dbsParse(cut);
+  assert.equal(c.rows.length, 3, "the rest is still read");
+  assert.equal(c.errors.length, 1);
+  assert.match(c.errors[0], /Skipped P1A25 REAR O2 SENSOR \(2014 · Sentra · Toyota of Ann Arbor\): its VIN wasn't in what was copied/);
+});
