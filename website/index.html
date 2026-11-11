@@ -2354,21 +2354,21 @@ function logJobDone(j) {
 const SCAN_SHORT = { ok: "Read", blocked: "Blocked", unreadable: "Couldn't read", error: "No answer", nosite: "No website" };
 function scanProblems() {
   const sd = (S.scan && S.scan.dealers) || {};
-  return [...S.dealers.entries()].filter(([id, d]) => !d.website || (sd[id] && sd[id].s !== "ok"))
+  return [...S.dealers.entries()].filter(([id, d]) => !d.website || (sd[id] && (sd[id].s !== "ok" || sd[id].m === "home")))
     .map(([id, d]) => ({ id, d, s: sd[id] || { s: d.website ? "" : "nosite" } })).sort((a, b) => a.d.name.localeCompare(b.d.name));
 }
 function renderScanPanel() {
   const el = $("#scan-sum"); if (!el) return;
   const sc = S.scan;
   if (!sc) { el.innerHTML = `<p class="notice"><b>Not running yet.</b>The lot scanner hasn't reported in. Follow the setup steps below to turn it on.</p>`; $("#scan-problems").innerHTML = ""; $("#scan-prob-n").textContent = "0"; return; }
-  const sd = sc.dealers || {}, n = {}; Object.values(sd).forEach(x => n[x.s] = (n[x.s] || 0) + 1);
+  const sd = sc.dealers || {}, n = {}; Object.values(sd).forEach(x => { const k = x.s === "ok" && x.m === "home" ? "home" : x.s; n[k] = (n[k] || 0) + 1; });
   const stale = sc.updated && Date.now() - Date.parse(sc.updated) > 3 * 36e5;
-  el.innerHTML = `<p class="kpis"><span><b>${n.ok || 0}</b>lots read</span><span><b>${(n.blocked || 0) + (n.unreadable || 0) + (n.error || 0)}</b>couldn't read</span><span><b>${[...S.dealers.values()].filter(d => !d.website).length}</b>no website</span><span><b>${[...S.lots.values()].reduce((k, l) => k + (l.cars || []).length, 0)}</b>Nissans found</span></p>
+  el.innerHTML = `<p class="kpis"><span><b>${n.ok || 0}</b>lots read</span>${n.home ? `<span><b>${n.home}</b>featured cars only</span>` : ""}<span><b>${(n.blocked || 0) + (n.unreadable || 0) + (n.error || 0)}</b>couldn't read</span><span><b>${[...S.dealers.values()].filter(d => !d.website).length}</b>no website</span><span><b>${[...S.lots.values()].reduce((k, l) => k + (l.cars || []).length, 0)}</b>Nissans found</span></p>
     <p class="legend">Last run ${esc(ago(sc.updated))}. ${sc.passDone ? `Last full pass finished ${esc(ago(sc.lastPassDone))}. The next one starts around ${esc(new Date(Date.parse(sc.passStart) + 4 * 36e5).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}.` : `Pass in progress: ${sc.cursor || 0} of ${sc.total || 0} dealers checked.`}</p>
     ${stale ? `<p class="notice"><b>The scanner hasn't run in a while.</b>Open the scanner in Google Apps Script and check its Executions list for errors.</p>` : ""}`;
   const probs = scanProblems();
   $("#scan-prob-n").textContent = String(probs.length);
-  $("#scan-problems").innerHTML = probs.length ? probs.slice(0, 200).map(x => `<div class="cline"><span><button type="button" class="jname" data-dopen="${x.id}">${esc(x.d.name)}</button><br><span class="legend">${esc(SCAN_SHORT[x.s.s] || "Not checked yet")}${x.s.e ? " · " + esc(x.s.e) : ""}</span></span>${x.d.website ? `<a class="btn quiet sm" href="${esc(x.d.website)}" target="_blank" rel="noopener">Site ↗</a>` : `<button type="button" class="btn quiet sm" data-dedit="${x.id}">Add website</button>`}</div>`).join("") : `<p class="legend">Every dealer with a website was read.</p>`;
+  $("#scan-problems").innerHTML = probs.length ? probs.slice(0, 200).map(x => `<div class="cline"><span><button type="button" class="jname" data-dopen="${x.id}">${esc(x.d.name)}</button><br><span class="legend">${esc(x.s.m === "home" && x.s.s === "ok" ? "Featured cars only" : SCAN_SHORT[x.s.s] || "Not checked yet")}${x.s.e ? " · " + esc(x.s.e) : ""}</span></span>${x.d.website ? `<a class="btn quiet sm" href="${esc(x.d.website)}" target="_blank" rel="noopener">Site ↗</a>` : `<button type="button" class="btn quiet sm" data-dedit="${x.id}">Add website</button>`}</div>`).join("") : `<p class="legend">Every dealer with a website was read.</p>`;
 }
 /* ---------- Recall checks by VIN (Team tab) ---------- */
 const VIN_RE17 = /^[A-HJ-NPR-Z0-9]{17}$/;

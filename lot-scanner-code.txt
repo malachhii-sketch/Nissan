@@ -24,7 +24,7 @@ const CONFIG = {
   recallEveryDays: 7,  // check each car on a lot again this often, to catch new recalls and finished repairs
 };
 
-const VERSION = "1.1";
+const VERSION = "1.2";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 NissanRecallLotScanner";
 
 /* =========================== Buttons you can run =========================== */
@@ -346,8 +346,8 @@ function algoliaRequests(p) {
 }
 
 const PAGE_PATHS = {
-  "dealer.com": ["/used-inventory/index.htm"],
-  "dealerinspire": ["/used-vehicles/"],
+  "dealer.com": ["/used-inventory/index.htm?make=Nissan", "/used-inventory/index.htm"],
+  "dealerinspire": ["/used-vehicles/?_dFR%5Bmake%5D%5B0%5D=Nissan", "/used-vehicles/"],
   "cdk": ["/VehicleSearchResults?search=preowned&make=Nissan"],
   "teamvelocity": ["/inventory/used?make=Nissan"],
   "dealereprocess": ["/inventory/used/?make=Nissan"],
@@ -355,7 +355,7 @@ const PAGE_PATHS = {
   "dealercenter": ["/inventory?make=Nissan"],
   "carsforsale": ["/inventory?make=Nissan"],
   "dealersocket": ["/inventory/used?make=Nissan"],
-  "": ["/inventory?make=Nissan", "/used-vehicles/?make=Nissan", "/inventory/used?make=Nissan", "/cars-for-sale?make=Nissan", "/used-cars?make=Nissan", "/inventory/"],
+  "": ["/inventory?make=Nissan", "/used-vehicles/?make=Nissan", "/inventory/used?make=Nissan", "/used-inventory/index.htm?make=Nissan", "/cars-for-sale?make=Nissan", "/used-cars?make=Nissan", "/inventory/"],
 };
 PAGE_PATHS.wordpress = PAGE_PATHS[""];
 
@@ -368,7 +368,7 @@ function DealerJob(d, learned, prevStatus) {
   this.base = originOf(d.website || d.inv || "");
   this.vins = {}; this.codes = []; this.blocked = 0; this.reached = 0;
   this.platform = ""; this.robots = null; this.seen = {}; this.found = [];
-  this.phase = "start"; this.round = 0; this.diag = [];
+  this.phase = "start"; this.round = 0; this.diag = []; this.fromHome = {};
 }
 DealerJob.prototype.start = function () {
   if (!this.base) { this.phase = "done"; return []; }
@@ -376,8 +376,18 @@ DealerJob.prototype.start = function () {
   const p = this.prev;
   if (!this.learned && p.s && p.s !== "ok" && p.s !== "nosite" && p.t && (p.w || "") === (this.d.website || "") &&
       Date.now() - Date.parse(p.t) < 20 * 36e5) { this.skipped = true; this.phase = "done"; return []; }
-  if (this.learned && this.learned.r && this.learned.r.length && this.learned.b === this.base) { this.phase = "fast"; return this.learned.r.map(fromSpec_); }
+  if (this.learned && this.learned.r && this.learned.r.length && this.learned.b === this.base && !homeOnlyLearned_(this.learned, this.base)) { this.phase = "fast"; return this.learned.r.map(fromSpec_); }
   return this.discover_();
+};
+/** A learned way of reading a dealer that is really just its homepage (featured cars only): don't reuse it. */
+function homeOnlyLearned_(l, base) {
+  if (l.m === "home") return true;
+  return l.m === "page" && l.r.every(function (q) { return originOf(q.u) === base && /^https?:\/\/[^\/]+\/?$/i.test(q.u); });
+}
+/** VINs seen somewhere other than the homepage (sitemaps, inventory pages, inventory data). */
+DealerJob.prototype.invCount_ = function () {
+  const fh = this.fromHome;
+  return Object.keys(this.vins).filter(function (v) { return !fh[v]; }).length;
 };
 DealerJob.prototype.discover_ = function () {
   this.phase = "discover";
@@ -393,7 +403,10 @@ DealerJob.prototype.take_ = function (req, r, tag) {
   if (r.code !== 200) return 0;
   const found = req.method === "post" ? findVins(r.text, "", /algolia/.test(req.url) ? "" : this.base) : findVins(r.text, req.url);
   const keys = Object.keys(found);
-  keys.forEach(function (v) { if (!this.vins[v]) this.vins[v] = found[v]; }.bind(this));
+  keys.forEach(function (v) {
+    if (!this.vins[v]) { this.vins[v] = found[v]; if (tag === "home") this.fromHome[v] = 1; }
+    else if (tag !== "home") delete this.fromHome[v];
+  }.bind(this));
   if (keys.length >= 3 && tag) this.found.push({ tag: tag, req: req, n: keys.length });
   return keys.length;
 };
@@ -410,7 +423,7 @@ DealerJob.prototype.step = function (reqs, resps) {
   }
   if (this.phase === "discover") {
     const home = resps[0], robots = resps[1], sm = resps[2];
-    this.take_(reqs[0], home, "page");
+    this.take_(reqs[0], home, "home"); // a homepage usually shows only a few featured cars
     this.homeHtml = home && home.code === 200 ? home.text : "";
     this.platform = fingerprint(this.homeHtml);
     this.robots = robots && robots.code === 200 ? parseRobots(robots.text) : null;
@@ -422,7 +435,7 @@ DealerJob.prototype.step = function (reqs, resps) {
     children = uniq_(children).filter(function (u) { return /^https?:/i.test(u); })
       .sort(function (x, y) { return rankSitemap(x) - rankSitemap(y); }).filter(function (u) { return rankSitemap(u) < 2; }).slice(0, 6);
     children.forEach(function (u) { self.seen[u] = 1; next.push({ url: u, tag: "sitemap" }); });
-    if (Object.keys(this.vins).length < 3 || this.platform === "dealer.com" || this.platform === "dealerinspire") {
+    if (this.invCount_() < 3 || this.platform === "dealer.com" || this.platform === "dealerinspire") {
       (PAGE_PATHS[this.platform] || PAGE_PATHS[""]).forEach(function (p) {
         const u = b + p; if (self.robots && !robotsAllows(self.robots, u)) { self.diag.push("robots blocks " + p); return; }
         next.push({ url: u, tag: "page" });
@@ -454,7 +467,7 @@ DealerJob.prototype.step = function (reqs, resps) {
       }
     });
     this.phase = "r3";
-    const want = Object.keys(this.vins).length < 3;
+    const want = this.invCount_() < 3;
     const extra = uniqReq_(next.filter(function (q) { return q.tag === "sitemap" || want; }));
     if (!extra.length) { this.phase = "done"; return []; }
     return extra.slice(0, 6);
@@ -483,9 +496,14 @@ DealerJob.prototype.result = function () {
     else {
       const best = {};
       this.found.forEach(function (f) { (best[f.tag] = best[f.tag] || []).push(f); });
-      const order = ["sitemap", "ddc", "algolia", "page", "fast"];
+      const order = ["sitemap", "ddc", "algolia", "page", "fast", "home"];
       const tag = order.filter(function (t) { return best[t]; })[0];
-      if (tag) {
+      if (tag === "home") {
+        // Only the homepage's featured cars: keep them, but look for the full inventory again next time.
+        res.method = "home";
+        res.diag = (this.platform ? this.platform + " · " : "") + "only the homepage's featured cars; couldn't find the full inventory" +
+          (this.diag.length ? " · " + this.diag.slice(0, 2).join(", ") : "");
+      } else if (tag) {
         res.method = tag;
         res.learned = { m: tag, b: this.base, r: best[tag].sort(function (x, y) { return y.n - x.n; }).slice(0, tag === "sitemap" ? 4 : 2).map(function (f) { return toSpec_(f.req); }) };
         if (tag === "sitemap" && best.page) res.learned.r = res.learned.r.concat(best.page.slice(0, 1).map(function (f) { return toSpec_(f.req); }));
