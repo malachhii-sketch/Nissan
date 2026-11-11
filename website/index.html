@@ -686,6 +686,8 @@ input[type="file"] { max-width: 100%; font-size: .9375rem; }
       <p class="legend">The open Nissan campaigns on each lot VIN, from Nissan's recall lookup or DBS. A saved result shows on that car everywhere in the CRM.</p>
       <div id="vin-sum"></div>
       <details class="gone"><summary>VINs to check (<span id="vin-todo-n">0</span>)</summary><div id="vin-todo"></div></details>
+      <div class="row"><button type="button" class="btn quiet sm" id="vin-xlsx">Download spreadsheet of cars to check</button><label class="btn quiet sm" for="vin-xlsx-in">Upload checked spreadsheet</label><input type="file" id="vin-xlsx-in" accept=".xlsx" hidden></div>
+      <p class="legend">The spreadsheet has a row for each car and recall its model and year may have. Check the car in DBS, pick Yes or No under "Still open?", add any other open campaign numbers, then upload it here.</p>
       <div class="row"><button type="button" class="btn" id="vin-auto">Check lot VINs with Nissan</button><button type="button" class="btn ghost sm" id="vin-auto-stop" hidden>Stop</button></div>
       <div id="vin-auto-out"><p class="legend">Asks Nissan's recall lookup about lot cars not checked in the last 7 days and saves each car's open campaign numbers. Nissan only answers a few at a time from the website; the lot scanner checks the rest every hour. Keep this page open while it runs.</p></div>
       <div class="field"><label class="label" for="vin-in">Results to save</label>
@@ -2594,9 +2596,9 @@ function renderVinPanel() {
     list.slice(0, 400).map(x => { const k = vcheck(x.c.v); return `<div class="cline"><span><button type="button" class="btn quiet sm" data-copy="${esc(x.c.v)}" title="Copy this VIN to paste into DBS">Copy</button> <span class="mono">${esc(x.c.v)}</span> ${esc(carName(x.c))}<br><span class="legend"><button type="button" class="jname" data-dopen="${x.id}">${esc(name(x.id))}</button>${k ? ` · last checked ${esc(dbsDay(k))}` : ` · ${esc(carRecallText(x.c))}`}</span></span></div>`; }).join("")
     : `<p class="legend">${cars.length ? "Every lot car that needs it has been checked." : "Lot cars appear here once the scanner has found some."}</p>`;
 }
-function renderVinPreview() {
+function renderVinPreview(parsed) {
   const out = $("#vin-preview"); if (!out) return;
-  vinParsed = parseVinResults($("#vin-in").value);
+  vinParsed = parsed && Array.isArray(parsed.rows) ? parsed : parseVinResults($("#vin-in").value);
   const { rows, errors } = vinParsed;
   if (!rows.length && !errors.length) { out.innerHTML = ""; return; }
   const at = vinIndex();
@@ -2606,7 +2608,7 @@ function renderVinPreview() {
       ${(() => { const plan = listDealerWrites(rows, nowISO()); return plan.carsAdded ? `<p class="legend">Also adds ${plural(plan.carsAdded, "car")} to dealer lots${plan.added.length ? `, and ${plural(plan.added.length, "new dealer")} to the Dealers tab: ${esc(plan.added.slice(0, 8).join(", "))}${plan.added.length > 8 ? ` and ${plan.added.length - 8} more` : ""}` : ""}.</p>` : ""; })()}
       <div class="row"><button type="button" class="btn" id="vin-save"${dis()}>Save ${plural(rows.length, "result")}</button><span class="legend">${rows.filter(r => r.open.length).length} with open campaigns · ${rows.filter(r => !r.open.length).length} with none</span></div>` : "");
 }
-$("#vin-in").addEventListener("input", renderVinPreview);
+$("#vin-in").addEventListener("input", () => renderVinPreview());
 $("#vin-preview").addEventListener("click", async e => {
   const btn = e.target.closest("#vin-save"); if (!btn || !vinParsed || !vinParsed.rows.length) return;
   if (!S.db || S.readOnly) { toast("Changes can't be saved in this view."); return; }
@@ -3144,6 +3146,106 @@ async function readXlsxRows(file) {
   });
   return rows;
 }
+
+/* ---------- Spreadsheet of cars to check (download, fill in, upload) ---------- */
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(b) { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC_T[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+/** A .zip with the files stored as they are (no compression): all an .xlsx needs. */
+function zipStore(files) {
+  const te = new TextEncoder(), parts = [], central = []; let off = 0;
+  const u16 = n => [n & 255, (n >>> 8) & 255], u32 = n => [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255];
+  files.forEach(([name, text]) => {
+    const nb = te.encode(name), data = te.encode(text), crc = crc32(data);
+    const head = [...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0x21), ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(nb.length), ...u16(0)];
+    parts.push(new Uint8Array([...u32(0x04034b50), ...head]), nb, data);
+    central.push(new Uint8Array([...u32(0x02014b50), ...u16(20), ...head, ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(off)]), nb);
+    off += 30 + nb.length + data.length;
+  });
+  const csize = central.reduce((n, b) => n + b.length, 0);
+  return new Blob([...parts, ...central, new Uint8Array([...u32(0x06054b50), 0, 0, 0, 0, ...u16(files.length), ...u16(files.length), ...u32(csize), ...u32(off), 0, 0])],
+    { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+}
+const xesc = v => String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+const colName = i => { let s = ""; i++; while (i) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; };
+/** One-sheet .xlsx: bold, frozen header row; a Yes/No dropdown in one column. */
+function buildXlsx(header, rows, dropdownCol, widths) {
+  const cell = (v, r, c, st) => (typeof v === "number" ? `<c r="${colName(c)}${r}"${st ? ' s="1"' : ""}><v>${v}</v></c>` : `<c r="${colName(c)}${r}" t="inlineStr"${st ? ' s="1"' : ""}><is><t xml:space="preserve">${xesc(v)}</t></is></c>`);
+  const data = [header].concat(rows).map((row, i) => `<row r="${i + 1}">${row.map((v, c) => v === "" || v == null ? "" : cell(v, i + 1, c, i === 0)).join("")}</row>`).join("");
+  const dv = rows.length ? `<dataValidations count="1"><dataValidation type="list" allowBlank="1" showErrorMessage="1" errorTitle="Pick Yes or No" error="Choose Yes (still open) or No (not open)." sqref="${colName(dropdownCol)}2:${colName(dropdownCol)}${rows.length + 1}"><formula1>"Yes,No"</formula1></dataValidation></dataValidations>` : "";
+  const ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"';
+  return zipStore([
+    ["[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'],
+    ["_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'],
+    ["xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook ${ns} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Cars to check" sheetId="1" r:id="rId1"/></sheets></workbook>`],
+    ["xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'],
+    ["xl/styles.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet ${ns}><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`],
+    ["xl/worksheets/sheet1.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet ${ns}><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${widths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("")}</cols><sheetData>${data}</sheetData>${dv}</worksheet>`],
+  ]);
+}
+const CHECK_HEAD = ["VIN", "Year", "Model", "Dealer", "City", "Dealer phone", "Recall #", "What it's for", "Recall date", "Still open?", "Other open campaigns", "Listing"];
+const CHECK_COL = { vin: 0, recall: 6, what: 7, open: 9, other: 10 };
+/** The lot cars to check (never checked, or checked 30+ days ago) with each recall their model and year may have: one row per car and recall. */
+function checkSheetRows() {
+  const old = Date.now() - 30 * 864e5, seen = new Set(), rows = [];
+  S.lots.forEach((lot, id) => ((lot && lot.cars) || []).forEach(c => {
+    if (!c || !c.v || seen.has(c.v) || isRemoved(c)) return;
+    seen.add(c.v);
+    const k = vcheck(c.v);
+    if (k && Date.parse(k.at) >= old) return;
+    const ids = carRecalls(c); if (!ids.length) return;
+    const d = S.dealers.get(id) || {};
+    ids.forEach(rid => {
+      const r = C[rid] || {}, what = r.comp ? `${compParts(r.comp).title}: ${String(r.defect || "").split(/(?<=\.)\s/)[0]}` : "";
+      rows.push([c.v, Number(c.y) || "", c.md || "", d.name || id, d.city || "", ((d.phones || [])[0] || {}).n || "", rid, what.slice(0, 250), r.date || "", "", "", c.u || ""]);
+    });
+  }));
+  return rows.sort((a, b) => String(a[3]).localeCompare(String(b[3])) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+}
+$("#vin-xlsx").addEventListener("click", () => {
+  const rows = checkSheetRows();
+  if (!rows.length) { toast("No lot cars need checking right now."); return; }
+  const blob = buildXlsx(CHECK_HEAD, rows, CHECK_COL.open, [20, 6, 14, 30, 16, 15, 12, 60, 11, 12, 22, 40]);
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `cars-to-check-${localISO()}.xlsx`;
+  document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  toast(`Downloaded ${plural(new Set(rows.map(r => r[0])).size, "car")} to check`);
+});
+/** Reads a filled-in spreadsheet: for each car, the recalls marked "Yes" plus any other campaign numbers are its open campaigns. */
+function parseCheckSheet(rows) {
+  const norm = v => String(v == null ? "" : v).trim().toLowerCase().replace(/[^a-z0-9#]+/g, " ").trim();
+  const hi = rows.findIndex(r => r && r.some(v => norm(v) === "vin") && r.some(v => norm(v) === "still open"));
+  if (hi < 0) return { rows: [], errors: ["This isn't the cars-to-check spreadsheet: it needs \"VIN\" and \"Still open?\" columns. Download it from this panel first."] };
+  const col = {}; rows[hi].forEach((h, i) => { const k = norm(h); if (k === "vin") col.vin = i; if (k === "recall #") col.recall = i; if (k === "what it s for") col.what = i; if (k === "still open") col.open = i; if (k === "other open campaigns") col.other = i; });
+  const cars = new Map(), errors = [];
+  rows.slice(hi + 1).forEach((r, n) => {
+    if (!r) return;
+    const vin = String(r[col.vin] == null ? "" : r[col.vin]).replace(/\s/g, "").toUpperCase(); if (!vin) return;
+    if (!VIN_RE17.test(vin)) { errors.push(`Row ${hi + n + 2}: "${vin}" isn't a VIN.`); return; }
+    const g = cars.get(vin) || { open: new Map(), yes: 0, no: 0, blank: 0 };
+    const ans = norm(r[col.open]), rid = String(r[col.recall] == null ? "" : r[col.recall]).trim().toUpperCase();
+    if (/^(yes|y|open|true)$/.test(ans)) { g.yes++; if (rid) g.open.set(rid, String(r[col.what] || "").split(":")[0].trim()); }
+    else if (/^(no|n|closed|done|false)$/.test(ans)) g.no++;
+    else if (!ans) g.blank++;
+    else errors.push(`Row ${hi + n + 2} (${vin}): "${r[col.open]}" under Still open? should be Yes or No.`);
+    String(col.other === undefined || r[col.other] == null ? "" : r[col.other]).toUpperCase().split(/[,;\s]+/).filter(x => /^[A-Z0-9]{3,10}$/.test(x) && /\d/.test(x) && /[A-Z]/.test(x)).forEach(x => { if (!g.open.has(x)) g.open.set(x, ""); g.other = true; });
+    cars.set(vin, g);
+  });
+  const out = [];
+  cars.forEach((g, vin) => {
+    if (!g.yes && !g.no && !g.other) return; // not checked yet
+    if (g.blank) errors.push(`${vin}: ${plural(g.blank, "recall")} left blank ${g.blank === 1 ? "was" : "were"} counted as not open.`);
+    out.push({ vin, open: [...g.open].map(([c, d]) => (d ? { c, d } : { c })).filter(o => /^[A-Z0-9]{3,10}$/.test(o.c)), src: "Nissan" });
+  });
+  if (!out.length && !errors.length) errors.push("No answers found. Pick Yes or No under \"Still open?\" for the cars you checked.");
+  return { rows: out, errors };
+}
+$("#vin-xlsx-in").addEventListener("change", async e => {
+  const f = e.target.files[0]; e.target.value = ""; if (!f) return;
+  let rows;
+  try { rows = await readXlsxRows(f); } catch (err) { toast(/browser/.test(err.message) ? err.message : "Couldn't open that file. Upload the .xlsx spreadsheet from this panel."); return; }
+  $("#vin-in").value = "";
+  renderVinPreview(parseCheckSheet(rows));
+  $("#vin-preview").scrollIntoView({ behavior: "smooth", block: "center" });
+});
 
 /* ---------- Open Recall Manifest import ---------- */
 const MHEAD = {

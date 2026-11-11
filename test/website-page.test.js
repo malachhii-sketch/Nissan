@@ -188,3 +188,22 @@ test("a pasted list adds missing dealers and their cars, and matches dealers the
   // Pasting the same list again adds nothing new.
   assert.equal(ctx.f.plan(rows, "2026-11-12T12:00:00Z").writes.length, 0);
 });
+
+/* ---------- Cars-to-check spreadsheet ---------- */
+test("reads a filled-in cars-to-check spreadsheet: Yes rows and other campaign numbers are open, blanks aren't checked", () => {
+  const ctx = { console, JSON, String, Number, Array, Object, RegExp, Math, Map, Set, VIN_RE17: /^[A-HJ-NPR-Z0-9]{17}$/, plural: (n, o) => `${n} ${n === 1 ? o : o + "s"}` };
+  vm.createContext(ctx);
+  vm.runInContext(grab("const CHECK_HEAD", "$(\"#vin-xlsx\")") + grab("function parseCheckSheet", "$(\"#vin-xlsx-in\")") + "\nthis.p = parseCheckSheet; this.H = CHECK_HEAD;", ctx);
+  const H = [...ctx.H], row = (vin, rid, open, other) => [vin, 2014, "Rogue", "Dealer", "City", "", rid, "Wiring: chafes.", "2021-03-01", open, other, ""];
+  const r = JSON.parse(JSON.stringify(ctx.p([H,
+    row("5N1AT2MV4EC836473", "21V123000", "Yes", ""), row("5N1AT2MV4EC836473", "15V456000", "No", "PC459, r21b9"),
+    row("1N4AL3AP1FC286673", "21V551000", "no", ""),
+    row("3N1AB7AP1KY233254", "19V100000", "", ""),
+    row("JN8AT2MV8HW000127", "18V001000", "Yes", ""), row("JN8AT2MV8HW000127", "18V002000", "", ""),
+    row("5N1AR2MM3FC658711", "15V700000", "maybe", "")])));
+  assert.deepEqual(r.rows.map((x) => [x.vin, x.open.map((o) => o.c)]), [
+    ["5N1AT2MV4EC836473", ["21V123000", "PC459", "R21B9"]], ["1N4AL3AP1FC286673", []], ["JN8AT2MV8HW000127", ["18V001000"]]]);
+  assert.match(r.errors.join("\n"), /JN8AT2MV8HW000127: 1 recall left blank was counted as not open/);
+  assert.match(r.errors.join("\n"), /"maybe" under Still open\? should be Yes or No/);
+  assert.match(ctx.p([["Name", "Phone"]]).errors[0], /isn't the cars-to-check spreadsheet/);
+});
