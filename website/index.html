@@ -2375,7 +2375,7 @@ function renderScanPanel() {
   const sd = sc.dealers || {}, n = {}; Object.values(sd).forEach(x => { const k = x.s === "ok" && x.m === "home" ? "home" : x.s; n[k] = (n[k] || 0) + 1; });
   const stale = sc.updated && Date.now() - Date.parse(sc.updated) > 3 * 36e5;
   el.innerHTML = `<p class="kpis"><span><b>${n.ok || 0}</b>lots read</span>${n.home ? `<span><b>${n.home}</b>featured cars only</span>` : ""}<span><b>${(n.blocked || 0) + (n.unreadable || 0) + (n.error || 0)}</b>couldn't read</span><span><b>${[...S.dealers.values()].filter(d => !d.website).length}</b>no website</span><span><b>${[...S.lots.values()].reduce((k, l) => k + (l.cars || []).length, 0)}</b>Nissans found</span></p>
-    <p class="legend">Last run ${esc(ago(sc.updated))}. ${sc.passDone ? `Last full pass finished ${esc(ago(sc.lastPassDone))}. The next one starts around ${esc(new Date(Date.parse(sc.passStart) + 4 * 36e5).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}.` : `Pass in progress: ${sc.cursor || 0} of ${sc.total || 0} dealers checked.`}</p>
+    <p class="legend">Last run ${esc(ago(sc.updated))}${sc.version ? ` (version ${esc(sc.version)})` : ""}. ${sc.passDone ? `Last full pass finished ${esc(ago(sc.lastPassDone))}. The next one starts around ${esc(new Date(Date.parse(sc.passStart) + 4 * 36e5).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}.` : `Pass in progress: ${sc.cursor || 0} of ${sc.total || 0} dealers checked.`}</p>
     ${scanRecallLine(sc.recalls)}
     ${stale ? `<p class="notice"><b>The scanner hasn't run in a while.</b>Open the scanner in Google Apps Script and check its Executions list for errors.</p>` : ""}`;
   const probs = scanProblems();
