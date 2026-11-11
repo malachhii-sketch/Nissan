@@ -24,7 +24,7 @@ const CONFIG = {
   recallEveryDays: 7,  // check each car on a lot again this often, to catch new recalls and finished repairs
 };
 
-const VERSION = "1.2";
+const VERSION = "1.4";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 NissanRecallLotScanner";
 
 /* =========================== Buttons you can run =========================== */
@@ -123,6 +123,10 @@ function scanInner_() {
       results.forEach(function (r, i) {
         const d = slice[i];
         if (r.skipped) return;
+        if (r.movedTo && r.movedTo !== d.website) {
+          writes.push({ path: "dealers/" + d.id, data: { website: r.movedTo }, fields: ["website"] });
+          d.website = r.movedTo;
+        }
         const prev = prevLots["lots/" + d.id] || null;
         const merged = mergeLot(prev, r, decoded, now, d);
         if (merged.changed) writes.push({ path: "lots/" + d.id, data: merged.lot });
@@ -379,6 +383,32 @@ DealerJob.prototype.start = function () {
   if (this.learned && this.learned.r && this.learned.r.length && this.learned.b === this.base && !homeOnlyLearned_(this.learned, this.base)) { this.phase = "fast"; return this.learned.r.map(fromSpec_); }
   return this.discover_();
 };
+/**
+ * Carsforsale.com dealer sites: list pages show no VINs, only links to each car's page. The sitemap lists one page per
+ * make the dealer has ("/nissan-for-sale-c566649"); the Nissan page links to each Nissan ("/details/used-2011-nissan-versa/71587705"),
+ * and each car's page shows its VIN.
+ */
+function cfsMakePages(xml, base) {
+  const locs = (String(xml || "").match(/<loc>\s*[^<\s]+/gi) || []).map(function (x) { return x.replace(/<loc>\s*/i, ""); })
+    .filter(function (u) { return originOf(u) === base; });
+  const makes = locs.filter(function (u) { return /\/[a-z0-9-]+-for-sale-c\d+\/?$/i.test(u); });
+  const nissan = makes.filter(function (u) { return /\/nissan-for-sale-c\d+\/?$/i.test(u); });
+  const models = makes.filter(function (u) { return /\/nissan-[a-z0-9-]+-for-sale-c\d+\/?$/i.test(u); });
+  return { anyMake: makes.length > 0, pages: nissan.length ? nissan.slice(0, 1) : models.slice(0, 4) };
+}
+function cfsDetailLinks(html, base) {
+  const out = {}, re = /href="(\/details\/[^"]*nissan[^"]*\/\d+)"/gi; let m;
+  while ((m = re.exec(html || ""))) out[base + m[1]] = 1;
+  return Object.keys(out);
+}
+/** Same website, ignoring "www." and http/https. */
+function sameSite_(a, b) { const k = function (u) { return originOf(u).replace(/^https:\/\/(www\.)?/, ""); }; return !!a && k(a) === k(b); }
+/** Where a dealer's homepage permanently sends visitors, when it's another website (the dealership was sold or renamed). */
+function movedTo_(r, base) {
+  if (!r || [301, 302, 307, 308].indexOf(r.code) < 0 || !/^https?:\/\//i.test(r.loc || "")) return "";
+  const o = originOf(r.loc);
+  return o && !sameSite_(o, base) ? o : "";
+}
 /** A learned way of reading a dealer that is really just its homepage (featured cars only): don't reuse it. */
 function homeOnlyLearned_(l, base) {
   if (l.m === "home") return true;
@@ -392,7 +422,8 @@ DealerJob.prototype.invCount_ = function () {
 DealerJob.prototype.discover_ = function () {
   this.phase = "discover";
   const b = this.base, reqs = [{ url: b + "/" }, { url: b + "/robots.txt" }, { url: b + "/sitemap.xml" }];
-  if (this.d.inv && /^https?:/i.test(this.d.inv)) reqs.push({ url: this.d.inv });
+  if (this.d.inv && /^https?:/i.test(this.d.inv) && !this.movedFrom) reqs.push({ url: this.d.inv });
+  if (!this.movedFrom) reqs.push({ url: b + "/", noFollow: true, tag: "where" }); // does the website now send visitors elsewhere?
   return reqs;
 };
 DealerJob.prototype.take_ = function (req, r, tag) {
@@ -423,18 +454,33 @@ DealerJob.prototype.step = function (reqs, resps) {
   }
   if (this.phase === "discover") {
     const home = resps[0], robots = resps[1], sm = resps[2];
+    const wi = reqs.findIndex(function (q) { return q.tag === "where"; });
+    const moved = wi >= 0 ? movedTo_(resps[wi], b) : "";
+    if (moved) {
+      // The website moved (often a sold or renamed dealership): read the new one instead, and report it so the CRM is updated.
+      this.movedFrom = b; this.base = moved; this.vins = {}; this.fromHome = {}; this.found = []; this.codes = []; this.blocked = 0; this.reached = 0;
+      return this.discover_();
+    }
     this.take_(reqs[0], home, "home"); // a homepage usually shows only a few featured cars
     this.homeHtml = home && home.code === 200 ? home.text : "";
     this.platform = fingerprint(this.homeHtml);
     this.robots = robots && robots.code === 200 ? parseRobots(robots.text) : null;
     this.take_(reqs[2], sm, "sitemap");
-    if (reqs[3]) this.take_(reqs[3], resps[3], "page");
+    if (reqs[3] && reqs[3].tag !== "where") this.take_(reqs[3], resps[3], "page");
     const next = [];
     let children = sitemapLinks(sm && sm.code === 200 ? sm.text : "").children;
     if (this.robots) children = children.concat(this.robots.sitemaps.filter(function (u) { return !/\/sitemap\.xml$/i.test(u) || originOf(u) !== b; }));
     children = uniq_(children).filter(function (u) { return /^https?:/i.test(u); })
       .sort(function (x, y) { return rankSitemap(x) - rankSitemap(y); }).filter(function (u) { return rankSitemap(u) < 2; }).slice(0, 6);
     children.forEach(function (u) { self.seen[u] = 1; next.push({ url: u, tag: "sitemap" }); });
+    const cfs = cfsMakePages(sm && sm.code === 200 ? sm.text : "", b);
+    if (cfs.anyMake && (this.platform === "carsforsale" || this.platform === "")) {
+      if (!cfs.pages.length) this.cfsRead = true; // the sitemap lists the dealer's makes, and Nissan isn't one of them
+      cfs.pages.forEach(function (u) {
+        if (self.robots && !robotsAllows(self.robots, u)) { self.diag.push("robots blocks the Nissan page"); return; }
+        next.push({ url: u, tag: "cfsmake" });
+      });
+    }
     if (this.invCount_() < 3 || this.platform === "dealer.com" || this.platform === "dealerinspire") {
       (PAGE_PATHS[this.platform] || PAGE_PATHS[""]).forEach(function (p) {
         const u = b + p; if (self.robots && !robotsAllows(self.robots, u)) { self.diag.push("robots blocks " + p); return; }
@@ -458,6 +504,13 @@ DealerJob.prototype.step = function (reqs, resps) {
           .sort(function (x, y) { return rankSitemap(x) - rankSitemap(y); }).slice(0, 4)
           .forEach(function (u) { self.seen[u] = 1; next.push({ url: u, tag: "sitemap" }); });
       }
+      if (q.tag === "cfsmake") {
+        self.cfsRead = true;
+        cfsDetailLinks(r.text, self.base).forEach(function (u) {
+          if (self.robots && !robotsAllows(self.robots, u)) return;
+          next.push({ url: u, tag: "cfsdetail" });
+        });
+      }
       if (q.tag === "page") {
         if (self.platform === "dealer.com" || /DDC\./.test(r.text)) {
           const p = ddcParams(r.text); if (!p.siteId) p.siteId = ddcParams(self.homeHtml).siteId;
@@ -468,9 +521,10 @@ DealerJob.prototype.step = function (reqs, resps) {
     });
     this.phase = "r3";
     const want = this.invCount_() < 3;
-    const extra = uniqReq_(next.filter(function (q) { return q.tag === "sitemap" || want; }));
-    if (!extra.length) { this.phase = "done"; return []; }
-    return extra.slice(0, 6);
+    const details = uniqReq_(next.filter(function (q) { return q.tag === "cfsdetail"; })).slice(0, 30);
+    const extra = uniqReq_(next.filter(function (q) { return q.tag !== "cfsdetail" && (q.tag === "sitemap" || want); })).slice(0, 6);
+    if (!extra.length && !details.length) { this.phase = "done"; return []; }
+    return extra.concat(details);
   }
   if (this.phase === "r3") {
     reqs.forEach(function (q, i) { self.take_(q, resps[i], q.tag); });
@@ -486,12 +540,14 @@ DealerJob.prototype.result = function () {
   const nissan = all.filter(isNissanVin).map(function (v) { return this.vins[v]; }.bind(this));
   let status;
   if (!this.base) status = "nosite";
-  else if (all.length >= 3) status = "ok";
+  else if (all.length >= 3 || this.cfsRead) status = "ok";
   else if (this.blocked && !this.reached) status = "blocked";
   else if (!this.reached) status = "error";
   else status = "unreadable";
   const res = { status: status, platform: this.platform, anyCount: all.length, nissan: nissan, method: this.method || "" };
-  if (status === "ok") {
+  if (status === "ok" && this.cfsRead) {
+    res.method = "carsforsale"; // read fresh each time: the list of Nissan pages changes as cars come and go
+  } else if (status === "ok") {
     if (this.keepLearned) res.learned = this.learned;
     else {
       const best = {};
@@ -514,6 +570,10 @@ DealerJob.prototype.result = function () {
     const codes = this.codes.filter(function (c) { return c; });
     res.diag = (this.platform ? this.platform + " · " : "") + "HTTP " + (codes.length ? uniq_(codes.map(String)).join("/") : "no answer") +
       (this.blocked ? " · bot check" : "") + (this.diag.length ? " · " + this.diag.slice(0, 2).join(", ") : "");
+  }
+  if (this.movedFrom) {
+    res.movedTo = this.base + "/";
+    res.diag = "website moved from " + this.movedFrom.replace(/^https:\/\//, "") + (res.diag ? " · " + res.diag : "");
   }
   if (this.rediscovered) res.rd = iso_();
   return res;
@@ -929,7 +989,7 @@ function http_(reqs) {
   if (!reqs.length) return [];
   const opts = reqs.map(function (q) {
     const o = {
-      url: q.url, method: q.method || "get", muteHttpExceptions: true, followRedirects: true, validateHttpsCertificates: true,
+      url: q.url, method: q.method || "get", muteHttpExceptions: true, followRedirects: !q.noFollow, validateHttpsCertificates: true,
       headers: Object.assign({ "User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7", "Accept-Language": "en-US,en;q=0.9" }, q.headers || {}),
     };
     if (q.payload) o.payload = q.payload;
@@ -939,7 +999,9 @@ function http_(reqs) {
   const wrap = function (r) {
     let text = ""; try { text = r.getContentText(); } catch (e) { text = ""; }
     if (text.length > 6e6) text = text.slice(0, 6e6);
-    return { code: r.getResponseCode(), text: text };
+    let loc = "";
+    try { const h = r.getHeaders() || {}; loc = String(h.Location || h.location || ""); } catch (e) { loc = ""; }
+    return { code: r.getResponseCode(), text: text, loc: loc };
   };
   try {
     return UrlFetchApp.fetchAll(opts).map(wrap);

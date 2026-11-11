@@ -24,7 +24,12 @@ function load(site) {
   const src = fs.readFileSync(path.join(__dirname, "..", "lot-scanner-code.txt"), "utf8") +
     "\nhttp_ = function (reqs) { return __web(reqs); }; this.DealerJob = DealerJob; this.runJobs_ = runJobs_;";
   const asked = [];
-  ctx.__web = (reqs) => reqs.map((q) => { asked.push(q.url); const page = site(q.url); return page == null ? { code: 404, text: "" } : { code: 200, text: page }; });
+  ctx.__web = (reqs) => reqs.map((q) => {
+    asked.push(q.url + (q.noFollow ? " (no follow)" : ""));
+    const page = site(q.url, q);
+    if (page && typeof page === "object") return page; // { code, text, loc }
+    return page == null ? { code: 404, text: "" } : { code: 200, text: page };
+  });
   vm.runInContext(src, ctx);
   return { ctx, asked };
 }
@@ -81,4 +86,63 @@ test("a sitemap full of vehicle pages still counts as reading the lot", () => {
   assert.equal(r.method, "sitemap");
   assert.equal(r.nissan.length, 4);
   assert.ok(!asked.includes(BASE + "/inventory?make=Nissan"), "no need for inventory pages");
+});
+
+test("Carsforsale sites: finds the Nissan page in the sitemap, opens each Nissan, and reads its VIN", () => {
+  const B = "https://www.example-cfs.com", v1 = vin("3N1", 7), v2 = vin("5N1", 8);
+  const { ctx, asked } = load((u) => {
+    if (u === B + "/") return '<link href="https://cdn09.carsforsale.com/x.css"><a href="/details/used-2017-ram-1500/1">Ram</a>';
+    if (u === B + "/sitemap.xml") return `<urlset><url><loc>${B}/bmw-for-sale-c1</loc></url><url><loc>${B}/nissan-for-sale-c566649</loc></url><url><loc>${B}/nissan-versa-for-sale-c566699</loc></url></urlset>`;
+    if (u === B + "/nissan-for-sale-c566649") return '<a href="/details/used-2011-nissan-versa/71587705">Versa</a><a href="/details/used-2019-nissan-rogue/71587706">Rogue</a><a href="/details/used-2017-ram-1500/1">Ram</a>';
+    if (u === B + "/details/used-2011-nissan-versa/71587705") return `<span class="vin-message"> ${v1}</span>`;
+    if (u === B + "/details/used-2019-nissan-rogue/71587706") return `<span class="vin-message"> ${v2}</span>`;
+    return null;
+  });
+  const r = ctx.runJobs_([new ctx.DealerJob({ id: "d1", name: "Example", website: B }, null, {})])[0];
+  assert.equal(r.status, "ok"); assert.equal(r.method, "carsforsale");
+  assert.deepEqual(r.nissan.map((x) => x.vin).sort(), [v1, v2].sort());
+  assert.ok(!asked.includes(B + "/details/used-2017-ram-1500/1"), "only opens the Nissans");
+  assert.equal(r.learned, undefined, "read fresh each time");
+});
+
+test("Carsforsale sites with no Nissan page count as read with no Nissans", () => {
+  const B = "https://www.example-cfs.com";
+  const { ctx } = load((u) => {
+    if (u === B + "/") return '<link href="https://cdn09.carsforsale.com/x.css">';
+    if (u === B + "/sitemap.xml") return `<urlset><url><loc>${B}/bmw-for-sale-c1</loc></url><url><loc>${B}/ram-for-sale-c2</loc></url></urlset>`;
+    return null;
+  });
+  const r = ctx.runJobs_([new ctx.DealerJob({ id: "d1", name: "Example", website: B }, null, {})])[0];
+  assert.equal(r.status, "ok"); assert.equal(r.method, "carsforsale"); assert.equal(r.nissan.length, 0);
+});
+
+test("a website that now sends visitors to another site: reads the new site and reports the move", () => {
+  const OLD = "https://www.elderford.com", NEW = "https://www.suburbanfordoftroy.com";
+  const { ctx, asked } = load((u, q) => {
+    if (u === OLD + "/" && q.noFollow) return { code: 301, text: "", loc: NEW + "/" };
+    if (u === OLD + "/") return listPage(featured);           // following the redirect lands on the new homepage
+    if (u.startsWith(OLD)) return { code: 301, text: "", loc: NEW + "/" };
+    if (u === NEW + "/") return listPage(featured);
+    if (u === NEW + "/inventory?make=Nissan") return listPage(nissans);
+    return null;
+  });
+  const r = ctx.runJobs_([new ctx.DealerJob({ id: "d1", name: "Elder Ford", website: OLD + "/" }, null, {})])[0];
+  assert.equal(r.status, "ok");
+  assert.equal(r.movedTo, NEW + "/");
+  assert.match(r.diag, /website moved from www\.elderford\.com/);
+  assert.equal(r.nissan.length, 4);
+  assert.equal(r.learned.b, NEW, "remembers the new site");
+  assert.ok(asked.includes(NEW + "/robots.txt"));
+});
+
+test("http to https or adding www is not a move", () => {
+  const B = "https://example-auto.com";
+  const { ctx } = load((u, q) => {
+    if (q.noFollow) return { code: 301, text: "", loc: "https://www.example-auto.com/" };
+    if (u === B + "/inventory?make=Nissan") return listPage(nissans);
+    return null;
+  });
+  const r = ctx.runJobs_([new ctx.DealerJob({ id: "d1", name: "Example", website: B }, null, {})])[0];
+  assert.equal(r.movedTo, undefined);
+  assert.equal(r.nissan.length, 4);
 });
